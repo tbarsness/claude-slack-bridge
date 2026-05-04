@@ -44,8 +44,12 @@ function buildThreadKey(channelId: string, threadTs: string): string {
   return `${channelId}:${threadTs}`;
 }
 
-function resolveAssistantForNewThread(channelId: string): string {
+function resolveAssistantForNewThread(channelId: string): string | undefined {
   return config.channelAssistants[channelId] ?? config.defaultAssistant;
+}
+
+function ownsAssistant(assistant: string | undefined): boolean {
+  return !!assistant && !!config.assistants[assistant];
 }
 
 interface ProcessParams {
@@ -53,7 +57,7 @@ interface ProcessParams {
   threadTs: string;
   reactionTs?: string;
   prompt: string;
-  assistantOverride?: string;
+  assistant: string;
   client: bolt.webApi.WebClient;
 }
 
@@ -62,10 +66,16 @@ async function processTurn({
   threadTs,
   reactionTs,
   prompt,
-  assistantOverride,
+  assistant,
   client,
 }: ProcessParams): Promise<void> {
   const threadKey = buildThreadKey(channelId, threadTs);
+  const workingDir = config.assistants[assistant];
+  if (!workingDir) {
+    log("dropped: unknown assistant", { threadKey, assistant });
+    return;
+  }
+
   await enqueue(threadKey, async () => {
     if (reactionTs) {
       await client.reactions
@@ -75,15 +85,6 @@ async function processTurn({
 
     try {
       const stored = await sessions.get(threadKey);
-      const assistant =
-        assistantOverride ??
-        stored?.assistant ??
-        resolveAssistantForNewThread(channelId);
-      const workingDir = config.assistants[assistant];
-      if (!workingDir) {
-        throw new Error(`Unknown assistant: ${assistant}`);
-      }
-
       const resume =
         stored?.assistant === assistant ? stored.sessionId : undefined;
 
@@ -181,6 +182,14 @@ export function buildApp(): bolt.App {
     // not by random channel chatter.
     if (channelType !== "im" && !stored) return;
 
+    // Resolve the assistant for this turn. Continue threads with whatever
+    // assistant they were started with; new DMs use channel mapping or
+    // DEFAULT_ASSISTANT. If this instance doesn't own the resolved assistant,
+    // stay silent — another bridge instance owns it.
+    const assistant =
+      stored?.assistant ?? resolveAssistantForNewThread(channelId);
+    if (!ownsAssistant(assistant)) return;
+
     if (!config.allowedUserIds.includes(userId)) {
       log("rejected unauthorized user", { userId });
       await say({
@@ -195,6 +204,7 @@ export function buildApp(): bolt.App {
     log("received", {
       userId,
       threadKey,
+      assistant,
       isNew: !threadTs,
       len: text.length,
     });
@@ -204,6 +214,7 @@ export function buildApp(): bolt.App {
       threadTs: threadRoot,
       reactionTs: ts,
       prompt: text,
+      assistant: assistant!,
       client,
     });
   });
@@ -266,7 +277,7 @@ export function buildApp(): bolt.App {
         threadTs: starterTs,
         reactionTs: starterTs,
         prompt: text,
-        assistantOverride: assistant,
+        assistant,
         client,
       });
     });

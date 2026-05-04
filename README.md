@@ -17,21 +17,42 @@ machine, no public URL needed.
 
 - **Slack ingress**: `@slack/bolt` in Socket Mode. No webhooks, no public URL.
 - **Auth**: hard allowlist on Slack user IDs.
-- **Assistants**: a single bridge process serves N assistants, each defined
-  by a name and a working directory in `ASSISTANTS`.
+- **Assistants**: a bridge process serves the assistants declared in its own
+  `ASSISTANTS` env var. You can run **multiple bridge instances** against the
+  same Slack app — each instance hosts the assistants whose working
+  directories live on its machine, and stays silent for everything else.
 - **Routing**:
   - Slash command `/<assistant> <message>` posts a starter message in the
     current channel and runs the named assistant on it. Replies to that
-    thread continue with the same assistant.
-  - DMs to the bot use `DEFAULT_ASSISTANT`.
+    thread continue with the same assistant. The slash command is only
+    handled by the bridge instance whose `ASSISTANTS` includes that name.
+  - DMs to the bot use `DEFAULT_ASSISTANT`. Only the instance configured
+    with a matching `DEFAULT_ASSISTANT` responds; in a multi-bridge setup,
+    set `DEFAULT_ASSISTANT` on exactly one instance.
   - `CHANNEL_ASSISTANTS` (optional) pins channels to specific assistants
     when threads are kicked off there.
 - **Sessions**: each `(channelId, threadTs)` pair maps to one Claude Code
   `session_id` plus the assistant that owns it, persisted to a JSON file so
-  the map survives restarts.
+  the map survives restarts. Each instance has its own sessions file, and
+  only handles thread replies it has stored locally.
 - **Backend**: `@anthropic-ai/claude-agent-sdk` with
   `permissionMode: "bypassPermissions"`, so the agent uses local tools without
   prompting. Run this on a trusted machine.
+
+### Multi-machine setup
+
+Slack delivers every event (messages and slash commands) to all Socket Mode
+clients connected for an app. Each bridge instance ignores events it can't
+handle:
+
+- A slash command for `/jude` is acked by the instance whose `ASSISTANTS`
+  declares `jude`. Other instances see the event but have no handler.
+- A thread reply is handled by the instance that has the thread's session
+  on disk. Other instances see the event but skip silently.
+- A new DM is handled by the instance whose `DEFAULT_ASSISTANT` is set.
+
+So: run one instance on each machine, declare the assistants whose code
+lives there, share the Slack app, and they cooperate without coordination.
 
 ## Quick start
 

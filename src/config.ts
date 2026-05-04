@@ -60,8 +60,12 @@ function parseChannelAssistants(
 }
 
 const assistants = parseAssistants(required("ASSISTANTS"));
-const defaultAssistant = required("DEFAULT_ASSISTANT");
-if (!assistants[defaultAssistant]) {
+const defaultAssistantRaw = process.env.DEFAULT_ASSISTANT?.trim();
+const defaultAssistant =
+  defaultAssistantRaw && defaultAssistantRaw !== ""
+    ? defaultAssistantRaw
+    : undefined;
+if (defaultAssistant && !assistants[defaultAssistant]) {
   throw new Error(
     `DEFAULT_ASSISTANT "${defaultAssistant}" not found in ASSISTANTS`,
   );
