@@ -22,15 +22,21 @@ machine, no public URL needed.
   same Slack app — each instance hosts the assistants whose working
   directories live on its machine, and stays silent for everything else.
 - **Routing**:
-  - Slash command `/<assistant> <message>` posts a starter message in the
-    current channel and runs the named assistant on it. Replies to that
+  - **Slash command** `/<assistant> <message>` posts a starter message in
+    the current channel and runs the named assistant on it. Replies to that
     thread continue with the same assistant. The slash command is only
     handled by the bridge instance whose `ASSISTANTS` includes that name.
-  - DMs to the bot use `DEFAULT_ASSISTANT`. Only the instance configured
+  - **Address prefix** in a message: starting a message with an assistant
+    name (`jude check this`, `@jude check this`, `jude: check this`,
+    `jude, check this`) routes that message to the named assistant. Inside
+    an existing thread it's a one-shot "guest turn" — the addressed
+    assistant answers but the thread's owner doesn't change. In a brand-new
+    DM the address prefix opens a new thread for that assistant.
+  - **DMs** to the bot use `DEFAULT_ASSISTANT`. Only the instance configured
     with a matching `DEFAULT_ASSISTANT` responds; in a multi-bridge setup,
     set `DEFAULT_ASSISTANT` on exactly one instance.
-  - `CHANNEL_ASSISTANTS` (optional) pins channels to specific assistants
-    when threads are kicked off there.
+  - **`CHANNEL_ASSISTANTS`** (optional) pins channels to specific
+    assistants when threads are kicked off there.
 - **Sessions**: each `(channelId, threadTs)` pair maps to one Claude Code
   `session_id` plus the assistant that owns it, persisted to a JSON file so
   the map survives restarts. Each instance has its own sessions file, and
@@ -48,11 +54,16 @@ handle:
 - A slash command for `/jude` is acked by the instance whose `ASSISTANTS`
   declares `jude`. Other instances see the event but have no handler.
 - A thread reply is handled by the instance that has the thread's session
-  on disk. Other instances see the event but skip silently.
-- A new DM is handled by the instance whose `DEFAULT_ASSISTANT` is set.
+  on disk. Other instances see the event and stay silent.
+- A new DM (top-level) is handled by the instance whose `DEFAULT_ASSISTANT`
+  is set.
+- An address-prefixed message (`jude check this`) is handled by the
+  instance hosting that assistant. Other instances recognize the name as a
+  peer's via `PEER_ASSISTANTS` and stay silent.
 
 So: run one instance on each machine, declare the assistants whose code
-lives there, share the Slack app, and they cooperate without coordination.
+lives there in `ASSISTANTS`, list peer assistants in `PEER_ASSISTANTS`,
+share the Slack app, and they cooperate without coordination.
 
 ## Quick start
 

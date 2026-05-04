@@ -59,7 +59,33 @@ function parseChannelAssistants(
   return out;
 }
 
+function parsePeerAssistants(
+  raw: string | undefined,
+  hosted: Record<string, string>,
+): string[] {
+  if (!raw) return [];
+  const out: string[] = [];
+  for (const name of raw.split(",").map((s) => s.trim()).filter(Boolean)) {
+    if (!/^[a-z][a-z0-9_-]*$/.test(name)) {
+      throw new Error(
+        `PEER_ASSISTANTS name "${name}" must be lowercase alphanumeric`,
+      );
+    }
+    if (hosted[name]) {
+      throw new Error(
+        `PEER_ASSISTANTS name "${name}" is also in ASSISTANTS; list each name in only one var`,
+      );
+    }
+    out.push(name);
+  }
+  return out;
+}
+
 const assistants = parseAssistants(required("ASSISTANTS"));
+const peerAssistants = parsePeerAssistants(
+  process.env.PEER_ASSISTANTS,
+  assistants,
+);
 const defaultAssistantRaw = process.env.DEFAULT_ASSISTANT?.trim();
 const defaultAssistant =
   defaultAssistantRaw && defaultAssistantRaw !== ""
@@ -82,6 +108,8 @@ export const config = {
     .map((s) => s.trim())
     .filter(Boolean),
   assistants,
+  peerAssistants,
+  knownAssistantNames: [...Object.keys(assistants), ...peerAssistants],
   defaultAssistant,
   channelAssistants: parseChannelAssistants(
     process.env.CHANNEL_ASSISTANTS,
