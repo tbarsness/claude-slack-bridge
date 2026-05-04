@@ -26,9 +26,10 @@ function extractText(message: unknown): string {
 export async function runClaude(
   prompt: string,
   resume: string | undefined,
+  workingDir: string,
 ): Promise<RunResult> {
   const options: Options = {
-    cwd: config.claude.workingDir,
+    cwd: workingDir,
     permissionMode: "bypassPermissions",
   };
   if (config.claude.systemPrompt) {

@@ -1,7 +1,12 @@
 import { readFile, writeFile, mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
 
-type Store = Record<string, string>;
+export interface SessionRecord {
+  sessionId: string;
+  assistant: string;
+}
+
+type Store = Record<string, SessionRecord>;
 
 export class SessionStore {
   private cache: Store | null = null;
@@ -24,14 +29,14 @@ export class SessionStore {
     return this.cache!;
   }
 
-  async get(threadId: string): Promise<string | undefined> {
+  async get(threadKey: string): Promise<SessionRecord | undefined> {
     const store = await this.load();
-    return store[threadId];
+    return store[threadKey];
   }
 
-  async set(threadId: string, sessionId: string): Promise<void> {
+  async set(threadKey: string, record: SessionRecord): Promise<void> {
     const store = await this.load();
-    store[threadId] = sessionId;
+    store[threadKey] = record;
     this.writing = this.writing.then(() => this.flush(store));
     await this.writing;
   }

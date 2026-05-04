@@ -5,7 +5,9 @@ import { initLog, log } from "./log.js";
 async function main(): Promise<void> {
   initLog(config.logDir);
   log("starting", {
-    cwd: config.claude.workingDir,
+    assistants: config.assistants,
+    default: config.defaultAssistant,
+    channelMap: config.channelAssistants,
     allowed: config.allowedUserIds,
   });
 
