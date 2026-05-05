@@ -202,7 +202,9 @@ export function buildApp(): bolt.App {
     // Resolve the assistant for this turn. Priority:
     //   1. Address prefix (e.g. "jude check this") - explicit override.
     //   2. Stored thread owner - continuing an existing conversation.
-    //   3. Channel mapping or DEFAULT_ASSISTANT - for new top-level DMs.
+    //   3. Channel mapping (CHANNEL_ASSISTANTS) - new threads in mapped
+    //      channels route to the mapped assistant.
+    //   4. DEFAULT_ASSISTANT - new top-level DMs only.
     // In a multi-bridge setup, every instance sees every event; only the one
     // that owns the resolved assistant acts.
     let assistant: string | undefined;
@@ -215,13 +217,18 @@ export function buildApp(): bolt.App {
       if (threadTs && stored?.assistant !== addressed) {
         guestTurn = true;
       }
+    } else if (stored) {
+      assistant = stored.assistant;
+    } else if (threadTs) {
+      // Thread reply we have no stored session for - another bridge owns it.
+      return;
+    } else if (channelType === "im") {
+      // New top-level DM - DEFAULT_ASSISTANT (set on exactly one bridge).
+      assistant = config.defaultAssistant;
     } else {
-      assistant = stored?.assistant ?? resolveAssistantForNewThread(channelId);
-      // Bail silently when there's no stored session AND either:
-      //   - we're in a non-DM channel (random channel chatter, not for us); or
-      //   - we're in a thread reply (the other bridge probably owns the thread).
-      // Only top-level DMs (no thread) fall through to DEFAULT_ASSISTANT.
-      if (!stored && (channelType !== "im" || threadTs)) return;
+      // New top-level non-DM message - only handle if channel is mapped.
+      assistant = config.channelAssistants[channelId];
+      if (!assistant) return;
     }
     if (!ownsAssistant(assistant)) return;
 
