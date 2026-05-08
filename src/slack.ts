@@ -171,12 +171,37 @@ async function processTurn({
 }
 
 export function buildApp(): bolt.App {
-  const app = new App({
+  // Watchdog logger: Bolt's socket-mode client emits a WARN log when a pong
+  // isn't received from the server, but its auto-reconnect can silently fail
+  // afterwards (process stays alive, websocket is dead). Intercept that WARN
+  // and exit so launchd respawns us with a fresh socket.
+  const watchdogLogger = {
+    setLevel: () => {},
+    getLevel: () => "info",
+    setName: () => {},
+    debug: (...m: unknown[]) => console.debug(...m),
+    info: (...m: unknown[]) => console.info(...m),
+    warn: (...m: unknown[]) => {
+      console.warn(...m);
+      const text = m
+        .map((x) => (typeof x === "string" ? x : JSON.stringify(x)))
+        .join(" ");
+      if (/pong wasn'?t received/i.test(text)) {
+        log("pong timeout detected, exiting");
+        setTimeout(() => process.exit(2), 50).unref();
+      }
+    },
+    error: (...m: unknown[]) => console.error(...m),
+  };
+
+  const appOptions = {
     token: config.slack.botToken,
     appToken: config.slack.appToken,
     signingSecret: config.slack.signingSecret,
     socketMode: true,
-  });
+    logger: watchdogLogger,
+  } as unknown as ConstructorParameters<typeof App>[0];
+  const app = new App(appOptions);
 
   app.message(async ({ message, client, say }) => {
     const m = message as unknown as Record<string, unknown>;
