@@ -15,6 +15,7 @@ use `/<assistant>` slash commands to talk to others.
    - **OAuth & Permissions** -> add these **Bot Token Scopes**:
      - `chat:write`
      - `commands`
+     - `files:read` (for image / file attachments — see below)
      - `im:history`
      - `im:read`
      - `im:write`
@@ -73,7 +74,25 @@ You should see an :eyes: reaction, then a reply in-thread from your default
 assistant. Then try `/<other-assistant> ping` from anywhere — it'll start a
 new thread with that assistant.
 
-## 4. Run as a launchd service (macOS)
+## 4. File attachments (images, PDFs, etc.)
+
+Drop a screenshot or other file into a Slack message and the bridge will
+download it (using the bot token) into the assistant's working directory at:
+
+```
+<workingDir>/.slack-uploads/<channelId>-<threadTs>/<fileId>-<filename>
+```
+
+The user's prompt is then augmented with a short block listing the absolute
+paths and MIME types of saved files, so Claude can `Read` them when it needs
+to look (Read handles images, PDFs, and text natively).
+
+Requires the `files:read` bot scope. Files larger than 50 MB are skipped.
+
+If you don't want these uploads tracked in git, add `.slack-uploads/` to
+the assistant's working-directory `.gitignore`.
+
+## 5. Run as a launchd service (macOS)
 
 To keep the bridge running, see [`launchd/README.md`](../launchd/README.md).
 

@@ -44,6 +44,10 @@ machine, no public URL needed.
 - **Backend**: `@anthropic-ai/claude-agent-sdk` with
   `permissionMode: "bypassPermissions"`, so the agent uses local tools without
   prompting. Run this on a trusted machine.
+- **Attachments**: files uploaded in a Slack message (images, PDFs, etc.)
+  are downloaded into `<workingDir>/.slack-uploads/<channelId>-<threadTs>/`
+  and their absolute paths are appended to the prompt so the assistant can
+  `Read` them. Requires the `files:read` bot scope.
 
 ### Multi-machine setup
 

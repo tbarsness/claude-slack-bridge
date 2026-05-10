@@ -3,6 +3,11 @@ import { config } from "./config.js";
 import { runClaude } from "./claude.js";
 import { SessionStore, type SessionRecord } from "./sessions.js";
 import { log } from "./log.js";
+import {
+  downloadAttachments,
+  formatAttachmentsForPrompt,
+  type SlackFile,
+} from "./attachments.js";
 
 const { App } = bolt;
 
@@ -75,6 +80,12 @@ interface ProcessParams {
    * assistant doesn't own.
    */
   guestTurn?: boolean;
+  /**
+   * Slack files attached to the inbound message (images, PDFs, etc.). The
+   * bridge downloads these into the assistant's working directory and tells
+   * Claude where to find them so it can Read them.
+   */
+  files?: SlackFile[];
   client: bolt.webApi.WebClient;
 }
 
@@ -85,6 +96,7 @@ async function processTurn({
   prompt,
   assistant,
   guestTurn = false,
+  files = [],
   client,
 }: ProcessParams): Promise<void> {
   const threadKey = buildThreadKey(channelId, threadTs);
@@ -108,15 +120,22 @@ async function processTurn({
           ? stored.sessionId
           : undefined;
 
+      const attachments = files.length
+        ? await downloadAttachments(files, workingDir, channelId, threadTs)
+        : [];
+      const finalPrompt =
+        prompt + formatAttachmentsForPrompt(attachments);
+
       log("dispatch", {
         threadKey,
         assistant,
         guestTurn,
         resume: resume ? "yes" : "no",
-        len: prompt.length,
+        len: finalPrompt.length,
+        attachments: attachments.length,
       });
 
-      const result = await runClaude(prompt, resume, workingDir);
+      const result = await runClaude(finalPrompt, resume, workingDir);
 
       if (result.sessionId && !guestTurn) {
         const record: SessionRecord = {
@@ -206,7 +225,10 @@ export function buildApp(): bolt.App {
   app.message(async ({ message, client, say }) => {
     const m = message as unknown as Record<string, unknown>;
 
-    if (typeof m.subtype === "string") return;
+    // Drop most subtyped events (channel_join, message_changed, etc.) but
+    // let `file_share` through — that's how Slack delivers a user message
+    // with file attachments.
+    if (typeof m.subtype === "string" && m.subtype !== "file_share") return;
     if (m.bot_id) return;
 
     const userId = typeof m.user === "string" ? m.user : undefined;
@@ -216,6 +238,9 @@ export function buildApp(): bolt.App {
     const channelType =
       typeof m.channel_type === "string" ? m.channel_type : undefined;
     const text = typeof m.text === "string" ? m.text : "";
+    const files: SlackFile[] = Array.isArray(m.files)
+      ? (m.files as SlackFile[])
+      : [];
 
     if (!userId || !channelId || !ts) return;
 
@@ -266,7 +291,9 @@ export function buildApp(): bolt.App {
       return;
     }
 
-    if (!text.trim()) return;
+    // Allow attachment-only messages (e.g. "here's a screenshot" with no
+    // text body) — the prompt will end up as just the attachment block.
+    if (!text.trim() && files.length === 0) return;
 
     log("received", {
       userId,
@@ -276,6 +303,7 @@ export function buildApp(): bolt.App {
       guestTurn,
       isNew: !threadTs,
       len: text.length,
+      files: files.length,
     });
 
     await processTurn({
@@ -285,6 +313,7 @@ export function buildApp(): bolt.App {
       prompt: text,
       assistant: assistant!,
       guestTurn,
+      files,
       client,
     });
   });
