@@ -111,6 +111,19 @@ export async function downloadAttachments(
         continue;
       }
 
+      // Slack returns HTTP 200 with an HTML login page when the bot lacks
+      // `files:read`. Saving that as `image.png` later causes the API to
+      // reject the request with "Could not process image". Detect and skip.
+      const contentType = res.headers.get("content-type") ?? "";
+      if (/^text\/html\b/i.test(contentType)) {
+        log("attachment fetch returned HTML (check bot has files:read scope)", {
+          id: file.id,
+          name: file.name,
+          contentType,
+        });
+        continue;
+      }
+
       const buf = Buffer.from(await res.arrayBuffer());
       if (buf.byteLength > MAX_BYTES) {
         log("attachment skipped (too large after fetch)", {
