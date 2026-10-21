@@ -76,12 +76,14 @@ type FetchResult =
  * Fetch one file into memory with the checks every download path needs: HTTP
  * status, an HTML page served in place of the file, and the size cap. Logs
  * and returns a reason instead of throwing. Callers choose the headers, so
- * only the Slack path ever sends the bot token.
+ * only the Slack path ever sends the bot token. `htmlHint`, when given, is
+ * appended to the HTML-response log line to say what usually causes it.
  */
 async function fetchFileBuffer(
   url: string,
   init: RequestInit,
   ctx: Record<string, unknown>,
+  htmlHint?: string,
 ): Promise<FetchResult> {
   const res = await fetch(url, init);
   if (!res.ok) {
@@ -89,12 +91,12 @@ async function fetchFileBuffer(
     return { ok: false, reason: `HTTP ${res.status}` };
   }
 
-  // Slack returns HTTP 200 with an HTML login page when the bot lacks
-  // `files:read`. Saving that as `image.png` later causes the API to
+  // A server can answer HTTP 200 with an HTML page (a login or error page)
+  // instead of the file. Saving that as `image.png` later causes the API to
   // reject the request with "Could not process image". Detect and skip.
   const contentType = res.headers.get("content-type") ?? "";
   if (/^text\/html\b/i.test(contentType)) {
-    log("attachment fetch returned HTML (check bot has files:read scope)", {
+    log(`attachment fetch returned HTML${htmlHint ? ` (${htmlHint})` : ""}`, {
       ...ctx,
       contentType,
     });
@@ -164,6 +166,9 @@ export async function downloadAttachments(
         url,
         { headers: { Authorization: `Bearer ${config.slack.botToken}` } },
         { id: file.id, name: file.name },
+        // Slack serves its HTML login page with HTTP 200 when the bot lacks
+        // `files:read`.
+        "check bot has files:read scope",
       );
       if (!fetched.ok) continue;
       const buf = fetched.buf;
@@ -281,8 +286,7 @@ export async function downloadBoardImages(
   allowedOrigins: string[] = boardImageOrigins(),
 ): Promise<BoardImages> {
   const unique = [...new Set(urls)];
-  const result: BoardImages = { saved: [], failed: [] };
-  if (!unique.length) return result;
+  if (!unique.length) return { saved: [], failed: [] };
 
   const destDir = resolve(
     workingDir,
@@ -290,53 +294,104 @@ export async function downloadBoardImages(
     `board-${sanitizeName(taskDocumentId)}`,
   );
 
+  // Filled by URL index, then compacted, so both lists keep the order the
+  // URLs came in however the fetches finish.
+  const savedAt: (DownloadedAttachment | undefined)[] = [];
+  const failedAt: (FailedImage | undefined)[] = [];
+  const toFetch: number[] = [];
+
   for (const [i, url] of unique.entries()) {
-    if (!isBoardUploadUrl(url, allowedOrigins)) {
-      log("board image refused (not a board upload)", { url });
-      result.failed.push({ url, reason: "not a board upload URL; not fetched" });
+    if (isBoardUploadUrl(url, allowedOrigins)) {
+      toFetch.push(i);
       continue;
     }
+    log("board image refused (not a board upload)", { url });
+    failedAt[i] = { url, reason: "not a board upload URL; not fetched" };
+  }
 
+  if (toFetch.length) {
+    let dirError: string | undefined;
     try {
-      const fetched = await fetchFileBuffer(
-        url,
-        // A redirect could lead off the board; refuse rather than follow.
-        { redirect: "error", signal: AbortSignal.timeout(30_000) },
-        { url },
-      );
-      if (!fetched.ok) {
-        result.failed.push({ url, reason: fetched.reason });
-        continue;
-      }
-
-      const mimetype =
-        fetched.contentType.split(";")[0]!.trim() || "application/octet-stream";
-      let base = "image";
-      try {
-        base = decodeURIComponent(new URL(url).pathname.split("/").pop() ?? "");
-      } catch {
-        // Undecodable name: fall back to "image".
-      }
-      const finalName = ensureExtension(sanitizeName(base || "image"), mimetype);
       await mkdir(destDir, { recursive: true });
-      const filePath = join(destDir, `${i + 1}-${finalName}`);
-      await writeFile(filePath, fetched.buf);
+    } catch (err) {
+      dirError = err instanceof Error ? err.message : String(err);
+    }
 
-      result.saved.push({
+    if (dirError !== undefined) {
+      for (const i of toFetch) {
+        const url = unique[i]!;
+        log("board image error", { url, msg: dirError });
+        failedAt[i] = { url, reason: dirError };
+      }
+    } else {
+      let next = 0;
+      const worker = async () => {
+        while (next < toFetch.length) {
+          const i = toFetch[next++]!;
+          const outcome = await saveBoardImage(unique[i]!, i, destDir);
+          if ("saved" in outcome) savedAt[i] = outcome.saved;
+          else failedAt[i] = outcome.failed;
+        }
+      };
+      await Promise.all(
+        Array.from({ length: Math.min(BOARD_FETCH_CONCURRENCY, toFetch.length) }, worker),
+      );
+    }
+  }
+
+  return {
+    saved: savedAt.filter((a): a is DownloadedAttachment => a !== undefined),
+    failed: failedAt.filter((f): f is FailedImage => f !== undefined),
+  };
+}
+
+/** How many board images are fetched at once. */
+const BOARD_FETCH_CONCURRENCY = 4;
+
+/**
+ * Fetch one allowed board image and save it as `${i + 1}-<name>` in
+ * `destDir`, which already exists. Never throws.
+ */
+async function saveBoardImage(
+  url: string,
+  i: number,
+  destDir: string,
+): Promise<{ saved: DownloadedAttachment } | { failed: FailedImage }> {
+  try {
+    const fetched = await fetchFileBuffer(
+      url,
+      // A redirect could lead off the board; refuse rather than follow.
+      { redirect: "error", signal: AbortSignal.timeout(30_000) },
+      { url },
+    );
+    if (!fetched.ok) return { failed: { url, reason: fetched.reason } };
+
+    const mimetype =
+      fetched.contentType.split(";")[0]!.trim() || "application/octet-stream";
+    let base = "image";
+    try {
+      base = decodeURIComponent(new URL(url).pathname.split("/").pop() ?? "");
+    } catch {
+      // Undecodable name: fall back to "image".
+    }
+    const finalName = ensureExtension(sanitizeName(base || "image"), mimetype);
+    const filePath = join(destDir, `${i + 1}-${finalName}`);
+    await writeFile(filePath, fetched.buf);
+
+    log("board image saved", { url, path: filePath, bytes: fetched.buf.byteLength });
+    return {
+      saved: {
         path: filePath,
         name: base || finalName,
         mimetype,
         size: fetched.buf.byteLength,
-      });
-      log("board image saved", { url, path: filePath, bytes: fetched.buf.byteLength });
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      log("board image error", { url, msg });
-      result.failed.push({ url, reason: msg });
-    }
+      },
+    };
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    log("board image error", { url, msg });
+    return { failed: { url, reason: msg } };
   }
-
-  return result;
 }
 
 /**
