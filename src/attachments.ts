@@ -256,7 +256,11 @@ export function isBoardUploadUrl(raw: string, allowedOrigins: string[]): boolean
   }
   if (u.username || u.password) return false;
   if (!allowedOrigins.includes(u.origin)) return false;
-  // URL parsing has already resolved any `..` segments.
+  // URL parsing has already resolved literal `..` segments, but leaves
+  // encoded separators alone, so `/uploads/..%2Fx` would still pass and its
+  // fate would rest on the board's static server. Strapi names uploads with a
+  // plain hash, so any encoded slash or backslash is refused outright.
+  if (/%2f|%5c/i.test(u.pathname)) return false;
   return u.pathname.startsWith("/uploads/");
 }
 
