@@ -68,6 +68,57 @@ function ensureExtension(name: string, mimetype: string): string {
   return ext ? `${name}.${ext}` : name;
 }
 
+type FetchResult =
+  | { ok: true; buf: Buffer; contentType: string }
+  | { ok: false; reason: string };
+
+/**
+ * Fetch one file into memory with the checks every download path needs: HTTP
+ * status, an HTML page served in place of the file, and the size cap. Logs
+ * and returns a reason instead of throwing. Callers choose the headers, so
+ * only the Slack path ever sends the bot token.
+ */
+async function fetchFileBuffer(
+  url: string,
+  init: RequestInit,
+  ctx: Record<string, unknown>,
+): Promise<FetchResult> {
+  const res = await fetch(url, init);
+  if (!res.ok) {
+    log("attachment fetch failed", { ...ctx, status: res.status });
+    return { ok: false, reason: `HTTP ${res.status}` };
+  }
+
+  // Slack returns HTTP 200 with an HTML login page when the bot lacks
+  // `files:read`. Saving that as `image.png` later causes the API to
+  // reject the request with "Could not process image". Detect and skip.
+  const contentType = res.headers.get("content-type") ?? "";
+  if (/^text\/html\b/i.test(contentType)) {
+    log("attachment fetch returned HTML (check bot has files:read scope)", {
+      ...ctx,
+      contentType,
+    });
+    return { ok: false, reason: "server returned an HTML page, not a file" };
+  }
+
+  const declared = Number(res.headers.get("content-length") ?? "");
+  if (Number.isFinite(declared) && declared > MAX_BYTES) {
+    log("attachment skipped (too large)", { ...ctx, size: declared });
+    return { ok: false, reason: `larger than ${MAX_BYTES} bytes` };
+  }
+
+  const buf = Buffer.from(await res.arrayBuffer());
+  if (buf.byteLength > MAX_BYTES) {
+    log("attachment skipped (too large after fetch)", {
+      ...ctx,
+      size: buf.byteLength,
+    });
+    return { ok: false, reason: `larger than ${MAX_BYTES} bytes` };
+  }
+
+  return { ok: true, buf, contentType };
+}
+
 /**
  * Download every Slack file attached to a message into a thread-scoped
  * folder under the assistant's working directory. Files are private to the
@@ -109,40 +160,13 @@ export async function downloadAttachments(
     }
 
     try {
-      const res = await fetch(url, {
-        headers: { Authorization: `Bearer ${config.slack.botToken}` },
-      });
-      if (!res.ok) {
-        log("attachment fetch failed", {
-          id: file.id,
-          name: file.name,
-          status: res.status,
-        });
-        continue;
-      }
-
-      // Slack returns HTTP 200 with an HTML login page when the bot lacks
-      // `files:read`. Saving that as `image.png` later causes the API to
-      // reject the request with "Could not process image". Detect and skip.
-      const contentType = res.headers.get("content-type") ?? "";
-      if (/^text\/html\b/i.test(contentType)) {
-        log("attachment fetch returned HTML (check bot has files:read scope)", {
-          id: file.id,
-          name: file.name,
-          contentType,
-        });
-        continue;
-      }
-
-      const buf = Buffer.from(await res.arrayBuffer());
-      if (buf.byteLength > MAX_BYTES) {
-        log("attachment skipped (too large after fetch)", {
-          id: file.id,
-          name: file.name,
-          size: buf.byteLength,
-        });
-        continue;
-      }
+      const fetched = await fetchFileBuffer(
+        url,
+        { headers: { Authorization: `Bearer ${config.slack.botToken}` } },
+        { id: file.id, name: file.name },
+      );
+      if (!fetched.ok) continue;
+      const buf = fetched.buf;
 
       const baseName = sanitizeName(file.name ?? file.title ?? "file");
       const mimetype = file.mimetype ?? "application/octet-stream";
@@ -189,4 +213,153 @@ export function formatAttachmentsForPrompt(
     "[Files attached in Slack — saved locally. Use the Read tool to view them:]",
     ...lines,
   ].join("\n");
+}
+
+/** The board's own host. Images are served from its `/uploads/` path. */
+const BOARD_ORIGIN = "https://work.timbarsness.com";
+
+/**
+ * Origins whose `/uploads/` the bridge will fetch board images from: the
+ * board's public host, plus wherever BOARD_API_URL points if that is another
+ * name for it (the .ts.net host, a dev box).
+ */
+export function boardImageOrigins(): string[] {
+  const origins = [BOARD_ORIGIN];
+  if (config.board.apiUrl) {
+    try {
+      const o = new URL(config.board.apiUrl).origin;
+      if (!origins.includes(o)) origins.push(o);
+    } catch {
+      // A malformed BOARD_API_URL already breaks heartbeats; ignore it here.
+    }
+  }
+  return origins;
+}
+
+/**
+ * True only for a URL under `/uploads/` on one of the allowed origins. A
+ * dispatch body names URLs for the bridge to fetch from this machine, so
+ * anything else (another host, another path on the board, embedded
+ * credentials) is refused before any request is made.
+ */
+export function isBoardUploadUrl(raw: string, allowedOrigins: string[]): boolean {
+  let u: URL;
+  try {
+    u = new URL(raw);
+  } catch {
+    return false;
+  }
+  if (u.username || u.password) return false;
+  if (!allowedOrigins.includes(u.origin)) return false;
+  // URL parsing has already resolved any `..` segments.
+  return u.pathname.startsWith("/uploads/");
+}
+
+export interface FailedImage {
+  url: string;
+  reason: string;
+}
+
+export interface BoardImages {
+  saved: DownloadedAttachment[];
+  failed: FailedImage[];
+}
+
+/**
+ * Download the images in a board message into a card-scoped folder under the
+ * assistant's working directory (`.slack-uploads/` is gitignored in every
+ * assistant repo). Board uploads are public on the tailnet, so no
+ * Authorization header is sent; the Slack bot token never leaves for here.
+ *
+ * Never throws: an image that cannot be fetched is returned in `failed` so
+ * the prompt can say so and the run still starts.
+ */
+export async function downloadBoardImages(
+  urls: string[],
+  workingDir: string,
+  taskDocumentId: string,
+  allowedOrigins: string[] = boardImageOrigins(),
+): Promise<BoardImages> {
+  const unique = [...new Set(urls)];
+  const result: BoardImages = { saved: [], failed: [] };
+  if (!unique.length) return result;
+
+  const destDir = resolve(
+    workingDir,
+    ".slack-uploads",
+    `board-${sanitizeName(taskDocumentId)}`,
+  );
+
+  for (const [i, url] of unique.entries()) {
+    if (!isBoardUploadUrl(url, allowedOrigins)) {
+      log("board image refused (not a board upload)", { url });
+      result.failed.push({ url, reason: "not a board upload URL; not fetched" });
+      continue;
+    }
+
+    try {
+      const fetched = await fetchFileBuffer(
+        url,
+        // A redirect could lead off the board; refuse rather than follow.
+        { redirect: "error", signal: AbortSignal.timeout(30_000) },
+        { url },
+      );
+      if (!fetched.ok) {
+        result.failed.push({ url, reason: fetched.reason });
+        continue;
+      }
+
+      const mimetype =
+        fetched.contentType.split(";")[0]!.trim() || "application/octet-stream";
+      let base = "image";
+      try {
+        base = decodeURIComponent(new URL(url).pathname.split("/").pop() ?? "");
+      } catch {
+        // Undecodable name: fall back to "image".
+      }
+      const finalName = ensureExtension(sanitizeName(base || "image"), mimetype);
+      await mkdir(destDir, { recursive: true });
+      const filePath = join(destDir, `${i + 1}-${finalName}`);
+      await writeFile(filePath, fetched.buf);
+
+      result.saved.push({
+        path: filePath,
+        name: base || finalName,
+        mimetype,
+        size: fetched.buf.byteLength,
+      });
+      log("board image saved", { url, path: filePath, bytes: fetched.buf.byteLength });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      log("board image error", { url, msg });
+      result.failed.push({ url, reason: msg });
+    }
+  }
+
+  return result;
+}
+
+/**
+ * The prompt block for a board message's images: where they were saved, an
+ * instruction to look at them before replying, and any that could not be
+ * fetched, so the assistant says so in the thread instead of guessing.
+ */
+export function formatBoardImagesForPrompt(images: BoardImages): string {
+  const { saved, failed } = images;
+  if (!saved.length && !failed.length) return "";
+  const lines = ["", ""];
+  if (saved.length) {
+    lines.push(
+      "[Images attached to Tim's message, saved locally. Use the Read tool to view every one of them before you reply:]",
+      ...saved.map((a) => `- ${a.path} (${a.mimetype}, ${a.size} bytes)`),
+    );
+  }
+  if (failed.length) {
+    if (saved.length) lines.push("");
+    lines.push(
+      "[Images in Tim's message that could not be downloaded. Say so in the thread rather than guessing what they show:]",
+      ...failed.map((f) => `- ${f.url} (${f.reason})`),
+    );
+  }
+  return lines.join("\n");
 }

@@ -5,6 +5,7 @@ import { config } from "./config.js";
 import { log } from "./log.js";
 import { runClaude } from "./claude.js";
 import { SessionStore } from "./sessions.js";
+import { downloadBoardImages, formatBoardImagesForPrompt } from "./attachments.js";
 
 /**
  * Private HTTP endpoint that lets work.timbarsness.com run an assistant.
@@ -43,6 +44,22 @@ interface DispatchBody {
   trigger?: string;
   author?: string;
   messageBody?: string;
+  /**
+   * Absolute URLs of images in Tim's message, under the board's /uploads/.
+   * Optional so the board and the bridge can deploy in either order.
+   */
+  images?: string[];
+}
+
+/** More images than this in one turn is a mistake, not a screenshot set. */
+const MAX_IMAGES = 20;
+
+/** The usable image URLs on a body, tolerating anything the JSON held. */
+function imageUrls(b: DispatchBody): string[] {
+  if (!Array.isArray(b.images)) return [];
+  return b.images.filter(
+    (u): u is string => typeof u === "string" && u.trim() !== "",
+  );
 }
 
 function safeEqual(a: string, b: string): boolean {
@@ -111,7 +128,10 @@ function activityLabel(type: string, subtype: string | undefined): string {
   return "working";
 }
 
-function buildPrompt(b: DispatchBody): string {
+export async function buildPrompt(
+  b: DispatchBody,
+  workingDir: string,
+): Promise<string> {
   const where = b.url ?? `card ${b.taskId ?? b.taskDocumentId}`;
   const head =
     b.trigger === "button"
@@ -156,7 +176,13 @@ function buildPrompt(b: DispatchBody): string {
     "only output that reaches Tim. Do not end without one.",
   );
 
-  return lines.join("\n");
+  const prompt = lines.join("\n");
+
+  // Without images this is exactly the prompt as it was before images existed.
+  const urls = [...new Set(imageUrls(b))].slice(0, MAX_IMAGES);
+  if (!urls.length) return prompt;
+  const images = await downloadBoardImages(urls, workingDir, b.taskDocumentId!);
+  return prompt + formatBoardImagesForPrompt(images);
 }
 
 export interface BoardDeps {
@@ -194,15 +220,24 @@ function takeQueued(key: string): DispatchBody | undefined {
   const q = queued.get(key);
   if (!q?.length) return undefined;
   queued.delete(key);
+  return mergeQueued(q);
+}
+
+/** Join queued dispatches into one: texts in order, images in order, deduplicated. */
+export function mergeQueued(q: DispatchBody[]): DispatchBody {
   const last = q[q.length - 1]!;
   const bodies = q
     .map((item) => item.messageBody?.trim())
     .filter((t): t is string => Boolean(t));
-  return {
+  const images = [...new Set(q.flatMap(imageUrls))];
+  const merged: DispatchBody = {
     ...last,
     trigger: "message",
     messageBody: bodies.length ? bodies.join("\n\n") : last.messageBody,
   };
+  if (images.length) merged.images = images;
+  else delete merged.images;
+  return merged;
 }
 
 async function runDispatch(deps: BoardDeps, b: DispatchBody): Promise<void> {
@@ -227,7 +262,8 @@ async function runDispatch(deps: BoardDeps, b: DispatchBody): Promise<void> {
 
   let lastBeat = 0;
 
-  const result = await runClaude(buildPrompt(b), resume, workingDir, {
+  const prompt = await buildPrompt(b, workingDir);
+  const result = await runClaude(prompt, resume, workingDir, {
     idleTimeoutMs: BOARD_IDLE_MS,
     onActivity: (a) => {
       const now = Date.now();
