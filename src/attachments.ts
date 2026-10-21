@@ -50,6 +50,16 @@ const MIME_EXT: Record<string, string> = {
   "text/markdown": "md",
   "text/csv": "csv",
   "application/json": "json",
+  // Slack voice clips — transcribed locally, see transcribe.ts.
+  "audio/mp4": "m4a",
+  "audio/m4a": "m4a",
+  "audio/x-m4a": "m4a",
+  "audio/mpeg": "mp3",
+  "audio/wav": "wav",
+  "audio/x-wav": "wav",
+  "audio/webm": "webm",
+  "audio/ogg": "ogg",
+  "video/mp4": "mp4",
 };
 
 function ensureExtension(name: string, mimetype: string): string {
