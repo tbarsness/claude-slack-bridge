@@ -6,6 +6,7 @@ import { log } from "./log.js";
 import { runClaude } from "./claude.js";
 import { SessionStore } from "./sessions.js";
 import { downloadBoardImages, formatBoardImagesForPrompt } from "./attachments.js";
+import { slackLinksForPrompt } from "./slack-links.js";
 
 /**
  * Private HTTP endpoint that lets work.timbarsness.com run an assistant.
@@ -176,7 +177,9 @@ export async function buildPrompt(
     "only output that reaches Tim. Do not end without one.",
   );
 
-  const prompt = lines.join("\n");
+  const prompt =
+    lines.join("\n") +
+    (await slackLinksForPrompt(b.messageBody ?? "", config.slack.userToken));
 
   // Without images this is exactly the prompt as it was before images existed.
   const urls = [...new Set(imageUrls(b))].slice(0, MAX_IMAGES);

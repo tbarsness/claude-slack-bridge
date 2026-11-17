@@ -111,6 +111,8 @@ export const config = {
     botToken: required("SLACK_BOT_TOKEN"),
     appToken: required("SLACK_APP_TOKEN"),
     signingSecret: required("SLACK_SIGNING_SECRET"),
+    /** Tim's read-only user token, for Slack links in board messages. */
+    userToken: process.env.SLACK_USER_TOKEN?.trim() || undefined,
   },
   allowedUserIds: required("ALLOWED_USER_IDS")
     .split(",")
