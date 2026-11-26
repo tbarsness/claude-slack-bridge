@@ -301,6 +301,11 @@ export class FoodChat {
     return { turn, created };
   }
 
+  /** The chat whose mirror thread has this root ts, if any. */
+  chatForThread(threadTs: string): string | undefined {
+    return this.deps.store.chatForThread(threadTs);
+  }
+
   /** Store an app event once and mirror it. Events never start a turn. */
   async recordEvent(input: { eventId: string; chat: string; kind: EventKind; entries: Row[] }): Promise<boolean> {
     const created = await this.deps.store.recordEvent(input);

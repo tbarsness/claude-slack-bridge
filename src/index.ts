@@ -3,7 +3,7 @@ import { buildApp, sessionStore } from "./slack.js";
 import { initLog, log } from "./log.js";
 import { startVoiceEndpoint } from "./voice-endpoint.js";
 import { startBoardEndpoint } from "./board-endpoint.js";
-import { startFoodChatEndpoint } from "./food-chat-endpoint.js";
+import { startFoodChatEndpoint, type FoodChat } from "./food-chat-endpoint.js";
 import { runClaude } from "./claude.js";
 
 const DISCONNECT_GRACE_MS = 30_000;
@@ -18,7 +18,9 @@ async function main(): Promise<void> {
     allowed: config.allowedUserIds,
   });
 
-  const app = buildApp();
+  // Set once the food chat starts, so mirror-thread replies reach it.
+  let foodChat: FoodChat | undefined;
+  const app = buildApp({ foodChat: () => foodChat });
   await app.start();
   log("ready (Socket Mode connected)");
 
@@ -30,7 +32,7 @@ async function main(): Promise<void> {
 
   // Ivy Mobile's food chats, over Tailscale only. A failure here must not
   // take the Slack bridge down with it.
-  await startFoodChatEndpoint({
+  foodChat = await startFoodChatEndpoint({
     config: config.foodChat,
     runClaude,
     slack: {
@@ -39,11 +41,12 @@ async function main(): Promise<void> {
         return { ts: r.ts };
       },
     },
-  }).catch((err: unknown) =>
+  }).catch((err: unknown) => {
     log("food chat endpoint failed to start", {
       msg: err instanceof Error ? err.message : String(err),
-    }),
-  );
+    });
+    return undefined;
+  });
 
   // Watchdog: Bolt has been observed to drop the socket silently (pong
   // timeouts without firing 'disconnected'). Exit on disconnect signals AND on

@@ -224,5 +224,7 @@ export const config = {
     foodlogUrl: foodlogUrl(foodChatDir),
     ceilingMs: Number(optional("FOODCHAT_TURN_CEILING_MS", String(15 * 60 * 1000))),
     timUserId: optional("FOODCHAT_TIM_USER_ID", allowedUserIds[0] ?? ""),
+    /** The assistant that answers the food chat; addressing it is not a guest turn. */
+    assistant: foodChatAssistant,
   },
 };
