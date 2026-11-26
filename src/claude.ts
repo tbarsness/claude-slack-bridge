@@ -73,6 +73,10 @@ export interface RunHooks {
   idleTimeoutMs?: number;
   /** Absolute ceiling regardless of activity. */
   maxTimeoutMs?: number;
+  /** Extra environment variables for the run, on top of the bridge's own. */
+  env?: Record<string, string>;
+  /** Aborting this stops the run through its own AbortController. */
+  signal?: AbortSignal;
 }
 
 /**
@@ -120,7 +124,7 @@ export async function runClaude(
   const ac = new AbortController();
   // Why the run was killed, so the caller can say which it was instead of
   // reporting the SDK's generic abort message.
-  let killedBy: "idle" | "max" | null = null;
+  let killedBy: "idle" | "max" | "caller" | null = null;
 
   let idleTimer: ReturnType<typeof setTimeout> | undefined;
   const resetIdle = () => {
@@ -136,6 +140,13 @@ export async function runClaude(
     killedBy = "max";
     ac.abort();
   }, maxMs);
+
+  const onCallerAbort = () => {
+    killedBy = "caller";
+    ac.abort();
+  };
+  if (hooks.signal?.aborted) onCallerAbort();
+  else hooks.signal?.addEventListener("abort", onCallerAbort, { once: true });
 
   const options: Options = {
     cwd: workingDir,
@@ -156,6 +167,9 @@ export async function runClaude(
   }
   if (resume) {
     options.resume = resume;
+  }
+  if (hooks.env) {
+    options.env = { ...process.env, ...hooks.env };
   }
 
   let sessionId: string | null = null;
@@ -228,13 +242,16 @@ export async function runClaude(
         ? `Went quiet for ${Math.round(idleMs / 60000)} minutes with no output, so I stopped waiting. Nothing was left half-finished on your side.`
         : killedBy === "max"
           ? `Ran past the ${Math.round(maxMs / 3600000)}-hour ceiling and was stopped.`
-          : raw;
+          : killedBy === "caller"
+            ? "Stopped by the caller."
+            : raw;
     // A failed run's session id is a fresh id the CLI minted and abandoned;
     // never hand it back for the caller to store.
     return { text, sessionId: null, error: message };
   } finally {
     if (idleTimer) clearTimeout(idleTimer);
     clearTimeout(maxTimer);
+    hooks.signal?.removeEventListener("abort", onCallerAbort);
   }
 
   return { text: text.trim(), sessionId };
