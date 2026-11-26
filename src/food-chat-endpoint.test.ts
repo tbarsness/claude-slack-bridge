@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, readdir, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AddressInfo } from "node:net";
@@ -60,6 +60,8 @@ class FakeSheet {
   days = new Map<string, SheetRow[]>();
   recipes: Recipe[] = [{ name: "Egg Bake", calories: 400, protein: 30, carbs: 10, fiber: 2, fat: 25, sodium: 700 }];
   reads: Record<string, string>[] = [];
+  /** GET actions that reject, to exercise the read-back failure paths. */
+  failActions = new Set<string>();
 
   add(date: string, items: string, notes: string): void {
     const rows = this.days.get(date) ?? [];
@@ -80,6 +82,7 @@ class FakeSheet {
 
   get = async (params: Record<string, string>): Promise<unknown> => {
     this.reads.push(params);
+    if (this.failActions.has(params.action!)) throw new Error(`Food Log read failed: HTTP 500`);
     if (params.action === "foodlog") {
       const entries = this.days.get(params.date!) ?? [];
       const totals = { calories: 0, protein: 0, carbs: 0, fiber: 0, fat: 0, sodium: 0 };
@@ -110,8 +113,13 @@ class FakeSlack {
   posts: Posted[] = [];
   failRoot = false;
   failAll = false;
+  /** Every post never settles, like a Slack call stuck in its retry window. */
+  hangAll = false;
+  /** Thread posts never settle; root posts still work. */
+  hangReplies = false;
   private n = 0;
   postMessage = async (args: Posted): Promise<{ ts?: string }> => {
+    if (this.hangAll || (this.hangReplies && args.thread_ts)) return new Promise(() => undefined);
     if (this.failAll) throw new Error("slack down");
     if (!args.thread_ts && this.failRoot) throw new Error("root post failed");
     this.n += 1;
@@ -130,11 +138,13 @@ interface Call {
 
 type Behavior = (call: Call) => Promise<RunResult>;
 
-async function setup(opts: { now?: Date; ceilingMs?: number; dir?: string; behavior?: Behavior } = {}) {
+async function setup(
+  opts: { now?: Date; ceilingMs?: number; dir?: string; behavior?: Behavior; slackTimeoutMs?: number; ivyDir?: string } = {},
+) {
   const dataDir = opts.dir ?? (await mkdtemp(join(tmpdir(), "food-chat-data-")));
-  const ivyDir = await mkdtemp(join(tmpdir(), "food-chat-ivy-"));
+  const ivyDir = opts.ivyDir ?? (await mkdtemp(join(tmpdir(), "food-chat-ivy-")));
   const store = new ChatStore(dataDir);
-  const interrupted = await store.load();
+  const { interrupted, queued } = await store.load();
   const sheet = new FakeSheet();
   const slack = new FakeSlack();
   const calls: Call[] = [];
@@ -151,7 +161,13 @@ async function setup(opts: { now?: Date; ceilingMs?: number; dir?: string; behav
     return behavior(call);
   };
   const chat = new FoodChat({
-    config: { secret: SECRET, channel: CHANNEL, ivyDir, ceilingMs: opts.ceilingMs ?? 60_000 },
+    config: {
+      secret: SECRET,
+      channel: CHANNEL,
+      ivyDir,
+      ceilingMs: opts.ceilingMs ?? 60_000,
+      ...(opts.slackTimeoutMs ? { slackTimeoutMs: opts.slackTimeoutMs } : {}),
+    },
     store,
     runClaude,
     foodlogGet: sheet.get,
@@ -178,6 +194,7 @@ async function setup(opts: { now?: Date; ceilingMs?: number; dir?: string; behav
     ivyDir,
     store,
     interrupted,
+    queued,
     sheet,
     slack,
     calls,
@@ -616,5 +633,208 @@ test("the Recipes chat prompt says not to log food, and a recipes turn marks rec
   assert.equal(turn.recipe!.after.protein, 38);
   const view = await t.request("GET", "/chats/recipes");
   assert.ok(view.body.recipesChangedAt);
+  await t.close();
+});
+
+test("after a restart a queued turn runs to done in order, and the running one is interrupted with its rows read back", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "food-chat-data-"));
+  const ivyDir = await mkdtemp(join(tmpdir(), "food-chat-ivy-"));
+  const before = new ChatStore(dir);
+  await before.load();
+  await before.acceptTurn({ turnId: uuid(120), chat: DAY, origin: "app", text: "eggs", photoCount: 0 });
+  await before.updateTurn(uuid(120), { state: "running" });
+  await before.acceptTurn({ turnId: uuid(121), chat: DAY, origin: "app", text: "toast please", photoCount: 1 });
+  await before.acceptTurn({ turnId: uuid(122), chat: DAY, origin: "app", text: "and coffee", photoCount: 0 });
+  // The queued turn's photo, saved before the restart the way submit() saves it.
+  const photoDir = join(ivyDir, ".slack-uploads", `food-chat-day-2026-11-26-${turnTag(uuid(121))}`);
+  await mkdir(photoDir, { recursive: true });
+  await writeFile(join(photoDir, "1-toast.jpg"), Buffer.from([0xff, 0xd8, 0xff]));
+
+  const order: string[] = [];
+  const t = await setup({
+    dir,
+    ivyDir,
+    behavior: async (call) => {
+      order.push(call.prompt.includes("toast please") ? "toast" : call.prompt.includes("and coffee") ? "coffee" : "other");
+      writeRow(t.sheet, call, call.prompt.includes("toast please") ? "toast" : "coffee");
+      return { text: "Logged.", sessionId: "sess-1" };
+    },
+  });
+  assert.deepEqual(t.interrupted.map((x) => x.turnId), [uuid(120)]);
+  assert.deepEqual(t.queued.map((x) => x.turnId), [uuid(121), uuid(122)]);
+  t.sheet.add("2026-11-26", "eggs", `via Ivy chat ${turnTag(uuid(120))}-1 08:00:00`);
+
+  await t.chat.resumeAfterRestart({ interrupted: t.interrupted, queued: t.queued });
+  await t.chat.idle();
+
+  const running = t.store.getTurn(uuid(120))!;
+  assert.equal(running.state, "interrupted");
+  assert.deepEqual(running.rows.map((r) => r.items), ["eggs"]);
+
+  assert.deepEqual(order, ["toast", "coffee"]);
+  const toast = t.store.getTurn(uuid(121))!;
+  assert.equal(toast.state, "done");
+  assert.deepEqual(toast.rows.map((r) => r.items), ["toast"]);
+  assert.ok(t.calls[0]!.prompt.includes(join(photoDir, "1-toast.jpg")));
+  assert.equal(t.store.getTurn(uuid(122))!.state, "done");
+  await t.close();
+});
+
+test("when the post-run Food Log read fails, the turn ends interrupted with the read-back error", async () => {
+  const t = await setup({
+    behavior: async (call) => {
+      writeRow(t.sheet, call, "eggs");
+      t.sheet.failActions.add("foodlog");
+      return { text: "Logged eggs.", sessionId: "sess-1" };
+    },
+  });
+  await t.request("POST", "/turns", { turnId: uuid(130), chat: DAY, text: "eggs", photos: [] });
+  await t.chat.idle();
+  const turn = t.store.getTurn(uuid(130))!;
+  assert.equal(turn.state, "interrupted");
+  assert.match(turn.error!, /^Could not read the Food Log back: /);
+  await t.close();
+});
+
+test("when the Recipes chat's post-run read fails, the turn ends interrupted with the read-back error", async () => {
+  const t = await setup({
+    behavior: async () => {
+      t.sheet.failActions.add("recipes");
+      return { text: "Updated.", sessionId: "sess-r" };
+    },
+  });
+  await t.request("POST", "/turns", { turnId: uuid(131), chat: "recipes", text: "egg bake is 38 g", photos: [] });
+  await t.chat.idle();
+  const turn = t.store.getTurn(uuid(131))!;
+  assert.equal(turn.state, "interrupted");
+  assert.match(turn.error!, /^Could not read the Food Log back: /);
+  await t.close();
+});
+
+test("when recover's read-back fails, the turn stays interrupted with the error set", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "food-chat-data-"));
+  const before = new ChatStore(dir);
+  await before.load();
+  await before.acceptTurn({ turnId: uuid(132), chat: DAY, origin: "app", text: "eggs", photoCount: 0 });
+  await before.updateTurn(uuid(132), { state: "running" });
+  const t = await setup({ dir });
+  t.sheet.failActions.add("foodlog");
+  await t.chat.recover(t.interrupted);
+  const turn = t.store.getTurn(uuid(132))!;
+  assert.equal(turn.state, "interrupted");
+  assert.match(turn.error!, /^Could not read the Food Log back: /);
+  await t.close();
+});
+
+test("a Slack root post that never settles times out: the turn ends done, not mirrored, and the next turn starts", async () => {
+  const t = await setup({ slackTimeoutMs: 50 });
+  t.slack.hangAll = true;
+  await t.request("POST", "/turns", { turnId: uuid(140), chat: DAY, text: "first", photos: [] });
+  await t.request("POST", "/turns", { turnId: uuid(141), chat: DAY, text: "second", photos: [] });
+  await t.chat.idle();
+  for (const id of [uuid(140), uuid(141)]) {
+    const turn = t.store.getTurn(id)!;
+    assert.equal(turn.state, "done");
+    assert.equal(turn.mirrored, false);
+  }
+  assert.equal(t.calls.length, 2);
+  await t.close();
+});
+
+test("a Slack thread post that never settles times out: the turn ends done, not mirrored, and the next turn starts", async () => {
+  const t = await setup({ slackTimeoutMs: 50 });
+  t.slack.hangReplies = true;
+  await t.request("POST", "/turns", { turnId: uuid(142), chat: DAY, text: "first", photos: [] });
+  await t.request("POST", "/turns", { turnId: uuid(143), chat: DAY, text: "second", photos: [] });
+  await t.chat.idle();
+  for (const id of [uuid(142), uuid(143)]) {
+    const turn = t.store.getTurn(id)!;
+    assert.equal(turn.state, "done");
+    assert.equal(turn.mirrored, false);
+  }
+  assert.equal(t.calls.length, 2);
+  // One root thread only: the root post landed and the replies timed out.
+  assert.equal(t.slack.posts.filter((p) => !p.thread_ts).length, 1);
+  await t.close();
+});
+
+test("an app event posted while a turn is running reaches the next turn's prompt", async () => {
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => (release = resolve));
+  let started!: () => void;
+  const running = new Promise<void>((resolve) => (started = resolve));
+  const t = await setup({
+    behavior: async (call) => {
+      if (call.prompt.includes("first")) {
+        started();
+        await gate;
+      }
+      return { text: "ok", sessionId: "sess-1" };
+    },
+  });
+  await t.request("POST", "/turns", { turnId: uuid(150), chat: DAY, text: "first", photos: [] });
+  await running;
+  await t.request("POST", "/events", {
+    eventId: uuid(151),
+    chat: DAY,
+    kind: "delete",
+    entries: [{ date: "2026-11-26", meal: "Lunch", items: "Mid Run Toast", calories: 90, protein: 3, carbs: 15, fiber: 1, fat: 1, sodium: 150, notes: "" }],
+  });
+  release();
+  await t.chat.idle();
+  assert.doesNotMatch(t.calls[0]!.prompt, /Mid Run Toast/);
+  await t.request("POST", "/turns", { turnId: uuid(152), chat: DAY, text: "second", photos: [] });
+  await t.chat.idle();
+  assert.match(t.calls[1]!.prompt, /delete.*Mid Run Toast/);
+  // Delivered once: a third turn does not list it again.
+  await t.request("POST", "/turns", { turnId: uuid(153), chat: DAY, text: "third", photos: [] });
+  await t.chat.idle();
+  assert.doesNotMatch(t.calls[2]!.prompt, /Mid Run Toast/);
+  await t.close();
+});
+
+test("an undo path with a malformed percent sequence gets 400", async () => {
+  const t = await setup();
+  const res = await t.request("POST", "/turns/%E0%A4%A/undo", { removed: 0, total: 0, alreadyGone: 0 });
+  assert.equal(res.status, 400);
+  await t.close();
+});
+
+test("a turn stopped at the ceiling with no rows found ends interrupted, not failed, so it is never offered for resend", async () => {
+  const t = await setup({
+    ceilingMs: 40,
+    behavior: async (call) => {
+      const signal = call.hooks.signal!;
+      await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
+      return { text: "", sessionId: null, error: "Stopped by the caller.", stopped: "caller" };
+    },
+  });
+  await t.request("POST", "/turns", { turnId: uuid(160), chat: DAY, text: "eggs", photos: [] });
+  await t.chat.idle();
+  const turn = t.store.getTurn(uuid(160))!;
+  assert.equal(turn.state, "interrupted");
+  assert.match(turn.error!, /Stopped at the time limit; nothing was found in the Food Log yet/);
+  await t.close();
+});
+
+test("a run killed for going quiet with no rows found ends interrupted, not failed", async () => {
+  const t = await setup({
+    behavior: async () => ({ text: "", sessionId: null, error: "Went quiet for 5 minutes with no output.", stopped: "idle" }),
+  });
+  await t.request("POST", "/turns", { turnId: uuid(161), chat: DAY, text: "eggs", photos: [] });
+  await t.chat.idle();
+  const turn = t.store.getTurn(uuid(161))!;
+  assert.equal(turn.state, "interrupted");
+  assert.match(turn.error!, /nothing was found in the Food Log yet/);
+  await t.close();
+});
+
+test("a run that ends with an ordinary error and no rows still ends failed with that error", async () => {
+  const t = await setup({ behavior: async () => ({ text: "", sessionId: null, error: "API overloaded" }) });
+  await t.request("POST", "/turns", { turnId: uuid(162), chat: DAY, text: "eggs", photos: [] });
+  await t.chat.idle();
+  const turn = t.store.getTurn(uuid(162))!;
+  assert.equal(turn.state, "failed");
+  assert.equal(turn.error, "API overloaded");
   await t.close();
 });

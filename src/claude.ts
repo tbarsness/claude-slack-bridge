@@ -52,6 +52,12 @@ export interface RunResult {
   text: string;
   sessionId: string | null;
   error?: string;
+  /**
+   * Set when the run was killed rather than ending on its own (idle limit,
+   * hard ceiling, or the caller's signal), so a write it started may still
+   * be landing.
+   */
+  stopped?: "idle" | "max" | "caller";
 }
 
 /** What the run is doing right now, for callers that show liveness. */
@@ -247,7 +253,7 @@ export async function runClaude(
             : raw;
     // A failed run's session id is a fresh id the CLI minted and abandoned;
     // never hand it back for the caller to store.
-    return { text, sessionId: null, error: message };
+    return { text, sessionId: null, error: message, ...(killedBy ? { stopped: killedBy } : {}) };
   } finally {
     if (idleTimer) clearTimeout(idleTimer);
     clearTimeout(maxTimer);

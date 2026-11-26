@@ -1,6 +1,6 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { timingSafeEqual } from "node:crypto";
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, readdir, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { RunHooks, RunResult } from "./claude.js";
 import { ensureExtension, formatBoardImagesForPrompt, sanitizeName, type DownloadedAttachment } from "./attachments.js";
@@ -11,6 +11,7 @@ import {
   isChatKey,
   isUuid,
   turnTag,
+  type Entry,
   type EventKind,
   type Macros,
   type Origin,
@@ -42,6 +43,12 @@ const TZ = "America/Chicago";
 
 /** How often, at most, a running turn writes its heartbeat. */
 const HEARTBEAT_MS = 10_000;
+
+/**
+ * Bound on each Slack mirror call. Bolt's WebClient retries for about 30
+ * minutes by default, and a mirror post runs inside the chat's queue slot.
+ */
+const SLACK_TIMEOUT_MS = 15_000;
 
 const MACRO_KEYS: (keyof Macros)[] = ["calories", "protein", "carbs", "fiber", "fat", "sodium"];
 
@@ -75,7 +82,10 @@ export type RunClaudeFn = (
 ) => Promise<RunResult>;
 
 export interface FoodChatDeps {
-  config: Pick<FoodChatConfig, "secret" | "channel" | "ivyDir" | "ceilingMs">;
+  config: Pick<FoodChatConfig, "secret" | "channel" | "ivyDir" | "ceilingMs"> & {
+    /** Per Slack call; defaults to SLACK_TIMEOUT_MS. */
+    slackTimeoutMs?: number;
+  };
   store: ChatStore;
   runClaude: RunClaudeFn;
   foodlogGet: FoodLogGet;
@@ -261,6 +271,25 @@ function parseRows(raw: unknown, date: string | null): Row[] | null {
 
 const isCount = (v: unknown): v is number => Number.isInteger(v) && (v as number) >= 0;
 
+/** Rejects after `ms`; the underlying call keeps running and its result is dropped. */
+function withTimeout<T>(p: Promise<T>, ms: number, what: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${what} timed out after ${ms} ms`)), ms);
+  });
+  return Promise.race([p, timeout]).finally(() => clearTimeout(timer));
+}
+
+const PHOTO_MIME: Record<string, string> = {
+  jpg: "image/jpeg",
+  jpeg: "image/jpeg",
+  png: "image/png",
+  gif: "image/gif",
+  webp: "image/webp",
+  heic: "image/heic",
+  heif: "image/heif",
+};
+
 export class FoodChat {
   private pending = new Set<Promise<unknown>>();
   private rootPosts = new Map<string, Promise<string | null>>();
@@ -351,13 +380,64 @@ export class FoodChat {
     );
   }
 
+  /**
+   * After a restart: read back turns left running (they stay interrupted) and
+   * run turns that were still queued, in their original order. A queued turn
+   * never reached runTurn, so nothing was written for it and running it now
+   * cannot log twice. Its text and photos come from what was saved on accept.
+   */
+  async resumeAfterRestart(loaded: { interrupted: Turn[]; queued: Turn[] }): Promise<void> {
+    const recovered = loaded.interrupted.length ? this.recover(loaded.interrupted) : Promise.resolve();
+    for (const turn of loaded.queued) {
+      const text = this.deps.store.messageText(turn.turnId) ?? "";
+      this.track(
+        enqueue(turn.chat, async () => {
+          const photos = await this.loadPhotos(turn.chat, turn.tag).catch((err: unknown) => {
+            log("food chat queued photos unreadable", { turnId: turn.turnId, msg: errorText(err) });
+            return [];
+          });
+          await this.runTurn(turn, text, photos);
+        }),
+      );
+    }
+    await recovered;
+  }
+
+  private photoDir(chat: string, tag: string): string {
+    return join(this.deps.config.ivyDir, ".slack-uploads", `food-chat-${chatFileName(chat).replace(/\.json$/, "")}-${tag}`);
+  }
+
+  /** Photos savePhotos wrote for a turn, in their original order. */
+  private async loadPhotos(chat: string, tag: string): Promise<DownloadedAttachment[]> {
+    const dir = this.photoDir(chat, tag);
+    let names: string[];
+    try {
+      names = await readdir(dir);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") return [];
+      throw err;
+    }
+    const numbered = names
+      .map((name) => ({ name, n: Number(/^(\d+)-/.exec(name)?.[1]) }))
+      .filter((f) => Number.isInteger(f.n))
+      .sort((a, b) => a.n - b.n);
+    const out: DownloadedAttachment[] = [];
+    for (const f of numbered) {
+      const path = join(dir, f.name);
+      const ext = /\.([A-Za-z0-9]+)$/.exec(f.name)?.[1]?.toLowerCase() ?? "";
+      out.push({
+        path,
+        name: f.name.replace(/^\d+-/, ""),
+        mimetype: PHOTO_MIME[ext] ?? "image/jpeg",
+        size: (await stat(path)).size,
+      });
+    }
+    return out;
+  }
+
   private async savePhotos(chat: string, tag: string, photos: Photo[]): Promise<DownloadedAttachment[]> {
     if (!photos.length) return [];
-    const dir = join(
-      this.deps.config.ivyDir,
-      ".slack-uploads",
-      `food-chat-${chatFileName(chat).replace(/\.json$/, "")}-${tag}`,
-    );
+    const dir = this.photoDir(chat, tag);
     await mkdir(dir, { recursive: true });
     const saved: DownloadedAttachment[] = [];
     for (const [i, p] of photos.entries()) {
@@ -410,7 +490,8 @@ export class FoodChat {
       if (dayRead.status === "fulfilled") day = dayRead.value;
       else unread.push(`the day's rows (${errorText(dayRead.reason)})`);
 
-      const prompt = this.buildPrompt(turn, text, photos, day, recipesBefore, unread);
+      const events = await store.takeEventsForPrompt(turn.turnId);
+      const prompt = this.buildPrompt(turn, text, photos, day, recipesBefore, unread, eventLines(events));
       const env: Record<string, string> = { IVY_CHAT_MARKER: `via Ivy chat ${turn.tag}` };
       if (date) env.IVY_CHAT_DATE = date;
 
@@ -419,7 +500,7 @@ export class FoodChat {
         await store.setSession(turn.chat, result.sessionId);
       }
       const reply = stripReplyTags(result.text);
-      const error = result.error ?? null;
+      let error = result.error ?? null;
 
       // The read-back runs only now that the run has settled, so a row
       // written as an abort lands is still found.
@@ -437,7 +518,18 @@ export class FoodChat {
           wrote = patch.recipe !== null;
           if (wrote || !recipesBefore) await store.setRecipesChangedAt(now().toISOString());
         }
-        state = !error ? "done" : wrote ? "partial" : "failed";
+        if (!error) state = "done";
+        else if (wrote) state = "partial";
+        else if (result.stopped || result.hitCeiling) {
+          // A killed run may have an addFood still landing, so a resend could
+          // log twice. Interrupted is never offered for resend.
+          state = "interrupted";
+          if (result.hitCeiling) {
+            error = "Stopped at the time limit; nothing was found in the Food Log yet.";
+          } else {
+            error = `Stopped before finishing; nothing was found in the Food Log yet. ${error}`;
+          }
+        } else state = "failed";
       } catch (err) {
         // What landed is unknown, so neither done nor failed is true.
         readError = `Could not read the Food Log back: ${errorText(err)}`;
@@ -464,7 +556,11 @@ export class FoodChat {
    * AbortController and this waits for the run to settle, so the queue slot is
    * held until the abort has landed.
    */
-  private async runWithCeiling(turn: Turn, prompt: string, env: Record<string, string>): Promise<RunResult> {
+  private async runWithCeiling(
+    turn: Turn,
+    prompt: string,
+    env: Record<string, string>,
+  ): Promise<RunResult & { hitCeiling: boolean }> {
     const { ceilingMs, ivyDir } = this.deps.config;
     const ac = new AbortController();
     let hitCeiling = false;
@@ -501,7 +597,8 @@ export class FoodChat {
         result = await run(undefined);
       }
       if (hitCeiling) {
-        result = {
+        return {
+          hitCeiling,
           ...result,
           error:
             ceilingMs >= 60_000
@@ -509,7 +606,7 @@ export class FoodChat {
               : `Ran past the ${Math.round(ceilingMs / 1000)}-second turn ceiling and was stopped.`,
         };
       }
-      return result;
+      return { ...result, hitCeiling: false };
     } finally {
       clearTimeout(timer);
     }
@@ -522,6 +619,7 @@ export class FoodChat {
     day: DayLog | null,
     recipes: Recipe[] | null,
     unread: string[],
+    events: string[],
   ): string {
     const date = chatDate(turn.chat);
     const local = localParts(this.deps.now());
@@ -550,7 +648,6 @@ export class FoodChat {
     }
     if (recipes) lines.push(`Recipes: ${recipes.map((r) => r.name).join(", ") || "none"}`);
     if (unread.length) lines.push(`Could not read: ${unread.join("; ")}`);
-    const events = this.eventsSinceLastTurn(turn.chat);
     if (events.length) lines.push("App events since the last turn:", ...events);
     lines.push("[End of context.]", "");
 
@@ -571,20 +668,6 @@ export class FoodChat {
     return lines.join("\n") + formatBoardImagesForPrompt({ saved: photos, failed: [] });
   }
 
-  /** App events after the chat's last reply, as prompt lines. */
-  private eventsSinceLastTurn(chat: string): string[] {
-    return this.deps.store
-      .eventsAfterLastReply(chat)
-      .filter((e) => e.event)
-      .map((e) => {
-        const ev = e.event!;
-        if (ev.kind === "undo") {
-          return `- undo of a chat reply: ${ev.undo?.removed ?? 0} of ${ev.undo?.total ?? 0} removed`;
-        }
-        return `- ${ev.kind}: ${ev.entries.map(rowLine).join("; ")}`;
-      });
-  }
-
   /** The chat's mirror thread, posting its root message the first time. */
   private ensureThread(chat: string): Promise<string | null> {
     const existing = this.deps.store.getThreadTs(chat);
@@ -598,14 +681,27 @@ export class FoodChat {
     const text = date
       ? `:fork_and_knife: *Food chat for ${weekday(date)} ${date}*`
       : ":fork_and_knife: *Recipes chat*";
+    // Keep the first root that landed; a later one (a timed-out post that
+    // landed after all, or a retry racing it) never replaces it.
+    const adopt = async (ts: string): Promise<string> => {
+      const current = this.deps.store.getThreadTs(chat);
+      if (current) return current;
+      await this.deps.store.setThreadTs(chat, ts);
+      return ts;
+    };
     const p = (async () => {
+      const call = this.deps.slack.postMessage({ channel: this.deps.config.channel, text });
       try {
-        const r = await this.deps.slack.postMessage({ channel: this.deps.config.channel, text });
+        const r = await withTimeout(call, this.slackTimeoutMs, "Slack root post");
         if (!r.ts) return null;
-        await this.deps.store.setThreadTs(chat, r.ts);
-        return r.ts;
+        return await adopt(r.ts);
       } catch (err) {
         log("food chat root post failed", { chat, msg: errorText(err) });
+        // A timed-out post may still land; use its thread rather than open
+        // a second one next time. Not tracked, so idle() never waits on it.
+        call
+          .then((r) => (r.ts ? adopt(r.ts) : undefined))
+          .catch(() => undefined);
         return null;
       } finally {
         this.rootPosts.delete(chat);
@@ -615,9 +711,21 @@ export class FoodChat {
     return p;
   }
 
+  private get slackTimeoutMs(): number {
+    return this.deps.config.slackTimeoutMs ?? SLACK_TIMEOUT_MS;
+  }
+
+  /**
+   * Post in order, each part bounded by the Slack timeout. A part that times
+   * out stops the rest and is never retried, so it cannot post twice.
+   */
   private async post(threadTs: string, text: string): Promise<void> {
     for (const part of chunk(text)) {
-      await this.deps.slack.postMessage({ channel: this.deps.config.channel, thread_ts: threadTs, text: part });
+      await withTimeout(
+        this.deps.slack.postMessage({ channel: this.deps.config.channel, thread_ts: threadTs, text: part }),
+        this.slackTimeoutMs,
+        "Slack mirror post",
+      );
     }
   }
 
@@ -715,7 +823,12 @@ export class FoodChat {
       return json(res, created ? 202 : 200, { ok: true });
     }
 
-    const turnId = decodeURIComponent(undoMatch![1]!);
+    let turnId: string;
+    try {
+      turnId = decodeURIComponent(undoMatch![1]!);
+    } catch {
+      return json(res, 400, { error: "invalid turnId" });
+    }
     if (!this.deps.store.getTurn(turnId)) {
       return isUuid(turnId) ? json(res, 404, { error: "unknown turn" }) : json(res, 400, { error: "invalid turnId" });
     }
@@ -725,6 +838,19 @@ export class FoodChat {
     const turn = await this.recordUndo(turnId, { removed: b.removed, total: b.total, alreadyGone: b.alreadyGone });
     return json(res, 200, { turn });
   }
+}
+
+/** App events as prompt lines. */
+function eventLines(entries: Entry[]): string[] {
+  return entries
+    .filter((e) => e.event)
+    .map((e) => {
+      const ev = e.event!;
+      if (ev.kind === "undo") {
+        return `- undo of a chat reply: ${ev.undo?.removed ?? 0} of ${ev.undo?.total ?? 0} removed`;
+      }
+      return `- ${ev.kind}: ${ev.entries.map(rowLine).join("; ")}`;
+    });
 }
 
 function eventLine(kind: EventKind, entries: Row[]): string {
@@ -746,7 +872,8 @@ export function createFoodChatServer(chat: FoodChat): Server {
 }
 
 /**
- * Start the endpoint, then read back turns a previous process left running.
+ * Start the endpoint, then read back turns a previous process left running
+ * and run the ones it left queued.
  * Returns the FoodChat so the Slack handler can hand mirror-thread replies to
  * it, or undefined when the endpoint is off.
  */
@@ -773,7 +900,7 @@ export async function startFoodChatEndpoint(opts: {
     return undefined;
   }
   const store = new ChatStore(cfg.dataDir);
-  const interrupted = await store.load();
+  const loaded = await store.load();
   const chat = new FoodChat({
     config: cfg,
     store,
@@ -786,9 +913,12 @@ export async function startFoodChatEndpoint(opts: {
   server.on("error", (err) => log("food chat endpoint listen error", { msg: err.message }));
   server.listen(cfg.port, cfg.host, () => log("food chat endpoint ready", { host: cfg.host, port: cfg.port }));
   server.unref();
-  if (interrupted.length) {
-    log("food chat reading back interrupted turns", { count: interrupted.length });
-    void chat.recover(interrupted).catch((err) => log("food chat recover failed", { msg: errorText(err) }));
+  if (loaded.interrupted.length || loaded.queued.length) {
+    log("food chat resuming after restart", {
+      interrupted: loaded.interrupted.length,
+      queued: loaded.queued.length,
+    });
+    void chat.resumeAfterRestart(loaded).catch((err) => log("food chat recover failed", { msg: errorText(err) }));
   }
   return chat;
 }

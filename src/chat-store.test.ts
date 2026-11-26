@@ -34,8 +34,8 @@ async function withDir(fn: (dir: string) => Promise<void>): Promise<void> {
 
 async function openStore(dir: string) {
   const store = new ChatStore(dir);
-  const interrupted = await store.load();
-  return { store, interrupted };
+  const { interrupted, queued } = await store.load();
+  return { store, interrupted, queued };
 }
 
 test("chat keys: recipes and real calendar days only", () => {
@@ -94,20 +94,24 @@ test("a store reloaded from disk still reports an accepted turn ID as known", as
   });
 });
 
-test("on reload, turns left queued or running become interrupted and are returned", async () => {
+test("on reload, a turn left running becomes interrupted; a queued turn stays queued; both are returned", async () => {
   await withDir(async (dir) => {
     const { store } = await openStore(dir);
     await store.acceptTurn({ turnId: TURN_A, chat: DAY, origin: "app", text: "eggs", photoCount: 0 });
     await store.updateTurn(TURN_A, { state: "running" });
     await store.acceptTurn({ turnId: TURN_B, chat: DAY, origin: "app", text: "toast", photoCount: 0 });
 
-    const { store: reloaded, interrupted } = await openStore(dir);
-    assert.deepEqual(interrupted.map((t) => t.turnId).sort(), [TURN_A, TURN_B].sort());
+    const { store: reloaded, interrupted, queued } = await openStore(dir);
+    assert.deepEqual(interrupted.map((t) => t.turnId), [TURN_A]);
+    assert.deepEqual(queued.map((t) => t.turnId), [TURN_B]);
     assert.equal(reloaded.getTurn(TURN_A)?.state, "interrupted");
-    assert.equal(reloaded.getTurn(TURN_B)?.state, "interrupted");
+    assert.equal(reloaded.getTurn(TURN_B)?.state, "queued");
+    assert.equal(reloaded.messageText(TURN_B), "toast");
 
-    const { interrupted: third } = await openStore(dir);
+    await reloaded.updateTurn(TURN_B, { state: "done" });
+    const { interrupted: third, queued: thirdQueued } = await openStore(dir);
     assert.deepEqual(third, []);
+    assert.deepEqual(thirdQueued, []);
   });
 });
 

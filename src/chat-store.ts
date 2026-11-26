@@ -62,6 +62,12 @@ export interface Turn {
   undo: UndoResult | null;
   mirrored: boolean;
   heartbeatAt: string | null;
+  /**
+   * The chat's last entry seq when this turn's prompt was built. The next
+   * turn's prompt lists app events after it, including any recorded while
+   * this turn ran. Absent on turns stored before the field existed.
+   */
+  contextSeq?: number | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -159,12 +165,16 @@ export class ChatStore {
   constructor(private readonly dir: string) {}
 
   /**
-   * Read every chat file. Turns left queued or running by a previous process
-   * become interrupted and are returned so the caller can read their rows back.
+   * Read every chat file. Turns left running by a previous process become
+   * interrupted and are returned so the caller can read their rows back.
+   * Turns still queued never started (nothing could have been written for
+   * them), so they stay queued and are returned in acceptance order for the
+   * caller to run again.
    */
-  async load(): Promise<Turn[]> {
+  async load(): Promise<{ interrupted: Turn[]; queued: Turn[] }> {
     await mkdir(this.dir, { recursive: true });
     const interrupted: Turn[] = [];
+    const queued: Turn[] = [];
     for (const name of await readdir(this.dir)) {
       if (!name.endsWith(".json")) continue;
       const file = JSON.parse(await readFile(join(this.dir, name), "utf8")) as ChatFile;
@@ -175,7 +185,9 @@ export class ChatStore {
       let changed = false;
       for (const turn of file.turns) {
         this.turnIndex.set(turn.turnId, turn);
-        if (turn.state === "queued" || turn.state === "running") {
+        if (turn.state === "queued") {
+          queued.push(turn);
+        } else if (turn.state === "running") {
           turn.state = "interrupted";
           turn.updatedAt = new Date().toISOString();
           interrupted.push(turn);
@@ -184,11 +196,19 @@ export class ChatStore {
       }
       if (changed) await this.save(file.chat);
     }
-    return interrupted;
+    return { interrupted, queued };
   }
 
   getTurn(turnId: string): Turn | undefined {
     return this.turnIndex.get(turnId);
+  }
+
+  /** The text of the message entry that opened this turn, or null. */
+  messageText(turnId: string): string | null {
+    const turn = this.turnIndex.get(turnId);
+    if (!turn) return null;
+    const entry = this.chats.get(turn.chat)?.entries.find((e) => e.kind === "message" && e.turnId === turnId);
+    return entry?.text ?? null;
   }
 
   /**
@@ -218,6 +238,7 @@ export class ChatStore {
       undo: null,
       mirrored: false,
       heartbeatAt: null,
+      contextSeq: null,
       createdAt: now,
       updatedAt: now,
     };
@@ -310,6 +331,31 @@ export class ChatStore {
       if (entries[i]!.kind === "event") out.push(entries[i]!);
     }
     return out.reverse();
+  }
+
+  /**
+   * App events for this turn's prompt: those after the latest point any
+   * earlier turn in the chat built its prompt, so events recorded while that
+   * turn ran are still delivered. Records this turn's own point. A chat whose
+   * turns predate contextSeq falls back to events after the last reply.
+   */
+  async takeEventsForPrompt(turnId: string): Promise<Entry[]> {
+    const turn = this.turnIndex.get(turnId);
+    if (!turn) throw new Error(`unknown turn: ${turnId}`);
+    const file = this.chat(turn.chat);
+    let after: number | null = null;
+    for (const t of file.turns) {
+      if (t.turnId === turnId || typeof t.contextSeq !== "number") continue;
+      after = Math.max(after ?? 0, t.contextSeq);
+    }
+    const events =
+      after === null
+        ? this.eventsAfterLastReply(turn.chat)
+        : file.entries.filter((e) => e.kind === "event" && e.seq > after!);
+    turn.contextSeq = file.lastSeq;
+    turn.updatedAt = new Date().toISOString();
+    await this.save(turn.chat);
+    return events;
   }
 
   getSession(chat: string): string | null {
