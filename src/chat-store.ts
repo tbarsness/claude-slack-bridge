@@ -3,10 +3,10 @@ import { mkdir, readdir, readFile, rename, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 /**
- * Durable food-chat transcripts (KTD4). One JSON file per chat key in a data
+ * Durable food-chat transcripts. One JSON file per chat key in a data
  * directory, written atomically (temp file, then rename). Holds every accepted
- * turn ID so a resend never runs twice, even after a restart (KTD3), and each
- * chat's Claude session and Slack mirror thread (KTD5).
+ * turn ID so a resend never runs twice, even after a restart, and each
+ * chat's Claude session and Slack mirror thread.
  */
 
 export interface Macros {
@@ -66,7 +66,8 @@ export interface Turn {
   updatedAt: string;
 }
 
-export type EventKind = "log" | "delete" | "restore";
+export const EVENT_KINDS = ["log", "delete", "restore"] as const;
+export type EventKind = (typeof EVENT_KINDS)[number];
 
 export interface EntryEvent {
   kind: EventKind | "undo";
@@ -130,7 +131,7 @@ export function chatFileName(key: string): string {
   return key === "recipes" ? "recipes.json" : `day-${key.slice(4)}.json`;
 }
 
-/** First 8 hex characters of SHA-256 of the turn ID (KTD7). */
+/** First 8 hex characters of SHA-256 of the turn ID. */
 export function turnTag(turnId: string): string {
   return createHash("sha256").update(turnId).digest("hex").slice(0, 8);
 }
@@ -301,6 +302,16 @@ export class ChatStore {
     };
   }
 
+  /** Event entries after the chat's last reply, oldest first. */
+  eventsAfterLastReply(chat: string): Entry[] {
+    const entries = this.chats.get(chat)?.entries ?? [];
+    const out: Entry[] = [];
+    for (let i = entries.length - 1; i >= 0 && entries[i]!.kind !== "reply"; i--) {
+      if (entries[i]!.kind === "event") out.push(entries[i]!);
+    }
+    return out.reverse();
+  }
+
   getSession(chat: string): string | null {
     return this.chats.get(chat)?.sessionId ?? null;
   }
@@ -374,7 +385,7 @@ export class ChatStore {
       .catch(() => undefined)
       .then(async () => {
         const tmp = `${path}.tmp`;
-        await writeFile(tmp, JSON.stringify(this.chats.get(chat), null, 2), "utf8");
+        await writeFile(tmp, JSON.stringify(this.chats.get(chat)), "utf8");
         await rename(tmp, path);
       });
     this.writing.set(chat, next);

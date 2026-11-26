@@ -6,6 +6,7 @@ import type { RunHooks, RunResult } from "./claude.js";
 import { ensureExtension, formatBoardImagesForPrompt, sanitizeName, type DownloadedAttachment } from "./attachments.js";
 import {
   ChatStore,
+  EVENT_KINDS,
   chatFileName,
   isChatKey,
   isUuid,
@@ -16,6 +17,7 @@ import {
   type RecipeChange,
   type Row,
   type Turn,
+  type TurnPatch,
   type UndoResult,
 } from "./chat-store.js";
 import { claudeLimiter, enqueue } from "./turn-queue.js";
@@ -23,14 +25,14 @@ import { chunk } from "./slack-chunk.js";
 import { log } from "./log.js";
 
 /**
- * Private HTTP endpoint for Ivy Mobile's food chats (KTD1, KTD2).
+ * Private HTTP endpoint for Ivy Mobile's food chats.
  *
  * Bound to localhost and published to the tailnet with `tailscale serve`, and
  * every request carries the shared secret. A turn is accepted with 202 and
  * runs in the background; the app polls the transcript. A turn ID already
- * accepted returns the existing record and never runs again (KTD3). The rows a
+ * accepted returns the existing record and never runs again. The rows a
  * turn logged come from reading the Food Log back by the turn's notes marker,
- * never from Ivy's own account of what it did (KTD7).
+ * never from Ivy's own account of what it did.
  */
 
 /** About 8 MB of photos once base64 has inflated them. */
@@ -42,7 +44,6 @@ const TZ = "America/Chicago";
 const HEARTBEAT_MS = 10_000;
 
 const MACRO_KEYS: (keyof Macros)[] = ["calories", "protein", "carbs", "fiber", "fat", "sodium"];
-const EVENT_KINDS: EventKind[] = ["log", "delete", "restore"];
 
 export interface FoodChatConfig {
   enabled: boolean;
@@ -52,12 +53,11 @@ export interface FoodChatConfig {
   dataDir: string;
   /** Slack channel for the mirror threads (#ivy); empty turns mirroring off. */
   channel: string;
-  /** Ivy's working directory. */
   ivyDir: string;
   foodlogUrl: string;
   /** Turn ceiling; set above runClaude's 5-minute idle limit. */
   ceilingMs: number;
-  /** Tim's Slack user ID, for routing mirror-thread replies (U6). */
+  /** Tim's Slack user ID, for routing mirror-thread replies. */
   timUserId: string;
 }
 
@@ -176,11 +176,15 @@ function weekday(date: string): string {
 }
 
 /** Remove `[ATTACH: path]` tags and unwrap `[VOICE: words]`; the app shows plain text. */
-export function stripReplyTags(text: string): string {
+function stripReplyTags(text: string): string {
   return text
     .replace(/\[VOICE:\s*([\s\S]*?)\]/g, (_, words: string) => words.trim())
     .replace(/\[ATTACH:\s*([^\]]+)\]/g, "")
     .trim();
+}
+
+function rowSummary(r: Row): string {
+  return `${r.items} (${r.meal}, ${r.calories} kcal)`;
 }
 
 function rowLine(r: Row): string {
@@ -191,15 +195,10 @@ function diffRecipes(before: Recipe[], after: Recipe[]): RecipeChange | null {
   const old = new Map(before.map((r) => [r.name.trim().toLowerCase(), r]));
   for (const r of after) {
     const prev = old.get(r.name.trim().toLowerCase());
-    const macros = macrosOf(r as unknown as Record<string, unknown>);
+    const macros = macrosOf({ ...r });
     if (!prev) return { action: "added", name: r.name, before: null, after: macros };
     if (MACRO_KEYS.some((k) => prev[k] !== r[k])) {
-      return {
-        action: "updated",
-        name: r.name,
-        before: macrosOf(prev as unknown as Record<string, unknown>),
-        after: macros,
-      };
+      return { action: "updated", name: r.name, before: macrosOf({ ...prev }), after: macros };
     }
   }
   return null;
@@ -301,7 +300,6 @@ export class FoodChat {
     return { turn, created };
   }
 
-  /** The chat whose mirror thread has this root ts, if any. */
   chatForThread(threadTs: string): string | undefined {
     return this.deps.store.chatForThread(threadTs);
   }
@@ -403,18 +401,14 @@ export class FoodChat {
       let recipesBefore: Recipe[] | null = null;
       let day: DayLog | null = null;
       const unread: string[] = [];
-      try {
-        recipesBefore = await this.readRecipes();
-      } catch (err) {
-        unread.push(`recipes (${errorText(err)})`);
-      }
-      if (date) {
-        try {
-          day = await this.readDay(date);
-        } catch (err) {
-          unread.push(`the day's rows (${errorText(err)})`);
-        }
-      }
+      const [recipesRead, dayRead] = await Promise.allSettled([
+        this.readRecipes(),
+        date ? this.readDay(date) : Promise.resolve(null),
+      ]);
+      if (recipesRead.status === "fulfilled") recipesBefore = recipesRead.value;
+      else unread.push(`recipes (${errorText(recipesRead.reason)})`);
+      if (dayRead.status === "fulfilled") day = dayRead.value;
+      else unread.push(`the day's rows (${errorText(dayRead.reason)})`);
 
       const prompt = this.buildPrompt(turn, text, photos, day, recipesBefore, unread);
       const env: Record<string, string> = { IVY_CHAT_MARKER: `via Ivy chat ${turn.tag}` };
@@ -431,7 +425,7 @@ export class FoodChat {
       // written as an abort lands is still found.
       let state: Turn["state"];
       let readError: string | null = null;
-      const patch: Parameters<ChatStore["updateTurn"]>[1] = {};
+      const patch: TurnPatch = {};
       try {
         let wrote: boolean;
         if (date) {
@@ -579,11 +573,9 @@ export class FoodChat {
 
   /** App events after the chat's last reply, as prompt lines. */
   private eventsSinceLastTurn(chat: string): string[] {
-    const { entries } = this.deps.store.read(chat);
-    let lastReply = 0;
-    for (const e of entries) if (e.kind === "reply") lastReply = e.seq;
-    return entries
-      .filter((e) => e.kind === "event" && e.seq > lastReply && e.event)
+    return this.deps.store
+      .eventsAfterLastReply(chat)
+      .filter((e) => e.event)
       .map((e) => {
         const ev = e.event!;
         if (ev.kind === "undo") {
@@ -641,7 +633,7 @@ export class FoodChat {
       }
       const parts = [reply || "_(no reply)_"];
       if (turn.error) parts.push(`:warning: ${turn.error}`);
-      if (turn.rows.length) parts.push(`Logged: ${turn.rows.map((r) => `${r.items} (${r.meal}, ${r.calories} kcal)`).join("; ")}`);
+      if (turn.rows.length) parts.push(`Logged: ${turn.rows.map(rowSummary).join("; ")}`);
       if (turn.recipe) parts.push(`Recipe ${turn.recipe.action}: ${turn.recipe.name}`);
       await this.post(threadTs, parts.join("\n\n"));
       return true;
@@ -737,7 +729,7 @@ export class FoodChat {
 
 function eventLine(kind: EventKind, entries: Row[]): string {
   const verb = kind === "log" ? "logged" : kind === "delete" ? "deleted" : "restored";
-  return `:iphone: App ${verb}: ${entries.map((r) => `${r.items} (${r.meal}, ${r.calories} kcal)`).join("; ")}`;
+  return `:iphone: App ${verb}: ${entries.map(rowSummary).join("; ")}`;
 }
 
 function errorText(err: unknown): string {

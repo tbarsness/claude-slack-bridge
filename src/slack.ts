@@ -129,7 +129,7 @@ export interface MirrorDeps {
 }
 
 /**
- * Route Tim's reply in a food-chat mirror thread to that chat as a turn (U6).
+ * Route Tim's reply in a food-chat mirror thread to that chat as a turn.
  * Returns false, leaving the message to the normal Slack path, for any other
  * thread, any other sender, and a message addressed to another assistant.
  * The turn ID is the message ts, so a redelivered event is the same turn and
@@ -162,7 +162,6 @@ export async function routeFoodChatMessage(
   return true;
 }
 
-/** Download a Slack message's images as food-chat photos; other files are skipped. */
 async function downloadSlackPhotos(
   files: SlackFile[],
   channelId: string,
@@ -514,7 +513,6 @@ export function buildApp(
       ? [text.trim(), ...forwarded.texts].filter(Boolean).join("\n\n")
       : text;
 
-    // Tim's replies in a food-chat mirror thread run as that chat's turns.
     if (
       await routeFoodChatMessage(
         { channelId, threadTs, ts, userId, text: prompt, files },

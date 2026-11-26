@@ -4,7 +4,7 @@
  * never run on the same Claude session at once.
  */
 
-export const threadQueues = new Map<string, Promise<void>>();
+const threadQueues = new Map<string, Promise<void>>();
 
 /**
  * Global cap on concurrently-running Claude subprocesses. Each turn spawns a
@@ -17,7 +17,7 @@ export const threadQueues = new Map<string, Promise<void>>();
  */
 const MAX_CONCURRENT_CLAUDE = Number(process.env.MAX_CONCURRENT_CLAUDE) || 2;
 
-export class Semaphore {
+class Semaphore {
   private active = 0;
   private queue: Array<() => void> = [];
   constructor(private readonly max: number) {}
