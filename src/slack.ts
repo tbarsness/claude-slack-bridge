@@ -5,6 +5,7 @@ import { config } from "./config.js";
 import { runClaude } from "./claude.js";
 import { SessionStore, type SessionRecord } from "./sessions.js";
 import { log } from "./log.js";
+import { enqueue, claudeLimiter } from "./turn-queue.js";
 import {
   downloadAttachments,
   formatAttachmentsForPrompt,
@@ -22,51 +23,6 @@ const sessions = new SessionStore(config.sessionsFile);
 
 /** Shared with the voice endpoint so spoken turns reuse the same store. */
 export const sessionStore = sessions;
-
-const threadQueues = new Map<string, Promise<void>>();
-
-/**
- * Global cap on concurrently-running Claude subprocesses. Each turn spawns a
- * full Claude Code agent; without a cap, a burst of messages (e.g. several
- * food-log entries in a row) spawns several heavy agents at once, pins the
- * host, and starves the Node event loop — which makes the Slack socket miss
- * pings and drop inbound messages during reconnects. Receipt is still
- * acknowledged instantly (the :eyes: reaction is added before acquiring a
- * slot); only the Claude run itself waits its turn.
- */
-const MAX_CONCURRENT_CLAUDE = Number(process.env.MAX_CONCURRENT_CLAUDE) || 2;
-
-class Semaphore {
-  private active = 0;
-  private queue: Array<() => void> = [];
-  constructor(private readonly max: number) {}
-  async run<T>(fn: () => Promise<T>): Promise<T> {
-    while (this.active >= this.max) {
-      await new Promise<void>((resolve) => this.queue.push(resolve));
-    }
-    this.active++;
-    try {
-      return await fn();
-    } finally {
-      this.active--;
-      this.queue.shift()?.();
-    }
-  }
-}
-
-const claudeLimiter = new Semaphore(MAX_CONCURRENT_CLAUDE);
-
-function enqueue(threadKey: string, work: () => Promise<void>): Promise<void> {
-  const prev = threadQueues.get(threadKey) ?? Promise.resolve();
-  const next = prev.catch(() => undefined).then(work);
-  threadQueues.set(
-    threadKey,
-    next.finally(() => {
-      if (threadQueues.get(threadKey) === next) threadQueues.delete(threadKey);
-    }),
-  );
-  return next;
-}
 
 const SLACK_CHUNK_LIMIT = 3000;
 
