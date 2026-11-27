@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import { resolve as resolvePath } from "node:path";
 import { config } from "./config.js";
 import { log } from "./log.js";
+import { appendParagraph, messageText } from "./turn-text.js";
 
 // Project-scoped .mcp.json files are a Claude Code CLI convention; the SDK
 // does not auto-load them. Bridge sessions therefore saw none of a project's
@@ -101,22 +102,6 @@ export interface RunHooks {
  */
 const IDLE_TIMEOUT_MS = 5 * 60 * 1000;
 const MAX_TIMEOUT_MS = 4 * 60 * 60 * 1000;
-
-function extractText(message: unknown): string {
-  if (!message || typeof message !== "object") return "";
-  const m = message as { content?: unknown };
-  if (!Array.isArray(m.content)) return "";
-  let out = "";
-  for (const block of m.content) {
-    if (block && typeof block === "object") {
-      const b = block as { type?: string; text?: string };
-      if (b.type === "text" && typeof b.text === "string") {
-        out += b.text;
-      }
-    }
-  }
-  return out;
-}
 
 export async function runClaude(
   prompt: string,
@@ -226,7 +211,7 @@ export async function runClaude(
         }
       }
       if (m.type === "assistant") {
-        text += extractText(m.message);
+        text = appendParagraph(text, messageText(m.message));
       }
 
       // `result` is the SDK's end-of-turn message, and the iterator is
