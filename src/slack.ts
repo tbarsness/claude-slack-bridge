@@ -1,10 +1,12 @@
 import bolt from "@slack/bolt";
 import { basename } from "node:path";
-import { unlink } from "node:fs/promises";
+import { readFile, unlink } from "node:fs/promises";
 import { config } from "./config.js";
 import { runClaude } from "./claude.js";
 import { SessionStore, type SessionRecord } from "./sessions.js";
 import { log } from "./log.js";
+import { enqueue, claudeLimiter } from "./turn-queue.js";
+import { chunk } from "./slack-chunk.js";
 import {
   downloadAttachments,
   formatAttachmentsForPrompt,
@@ -15,6 +17,7 @@ import {
   formatTranscriptsForPrompt,
 } from "./transcribe.js";
 import { parseVoiceTags, synthesizeAll } from "./speak.js";
+import type { FoodChat, Photo } from "./food-chat-endpoint.js";
 
 const { App } = bolt;
 
@@ -22,69 +25,6 @@ const sessions = new SessionStore(config.sessionsFile);
 
 /** Shared with the voice endpoint so spoken turns reuse the same store. */
 export const sessionStore = sessions;
-
-const threadQueues = new Map<string, Promise<void>>();
-
-/**
- * Global cap on concurrently-running Claude subprocesses. Each turn spawns a
- * full Claude Code agent; without a cap, a burst of messages (e.g. several
- * food-log entries in a row) spawns several heavy agents at once, pins the
- * host, and starves the Node event loop — which makes the Slack socket miss
- * pings and drop inbound messages during reconnects. Receipt is still
- * acknowledged instantly (the :eyes: reaction is added before acquiring a
- * slot); only the Claude run itself waits its turn.
- */
-const MAX_CONCURRENT_CLAUDE = Number(process.env.MAX_CONCURRENT_CLAUDE) || 2;
-
-class Semaphore {
-  private active = 0;
-  private queue: Array<() => void> = [];
-  constructor(private readonly max: number) {}
-  async run<T>(fn: () => Promise<T>): Promise<T> {
-    while (this.active >= this.max) {
-      await new Promise<void>((resolve) => this.queue.push(resolve));
-    }
-    this.active++;
-    try {
-      return await fn();
-    } finally {
-      this.active--;
-      this.queue.shift()?.();
-    }
-  }
-}
-
-const claudeLimiter = new Semaphore(MAX_CONCURRENT_CLAUDE);
-
-function enqueue(threadKey: string, work: () => Promise<void>): Promise<void> {
-  const prev = threadQueues.get(threadKey) ?? Promise.resolve();
-  const next = prev.catch(() => undefined).then(work);
-  threadQueues.set(
-    threadKey,
-    next.finally(() => {
-      if (threadQueues.get(threadKey) === next) threadQueues.delete(threadKey);
-    }),
-  );
-  return next;
-}
-
-const SLACK_CHUNK_LIMIT = 3000;
-
-function chunk(text: string, max = SLACK_CHUNK_LIMIT): string[] {
-  if (text.length <= max) return [text];
-  const out: string[] = [];
-  let i = 0;
-  while (i < text.length) {
-    let end = Math.min(i + max, text.length);
-    if (end < text.length) {
-      const lastNewline = text.lastIndexOf("\n", end);
-      if (lastNewline > i + max / 2) end = lastNewline;
-    }
-    out.push(text.slice(i, end));
-    i = end;
-  }
-  return out;
-}
 
 /**
  * Extract `[ATTACH: /absolute/path]` tags from Claude's response text.
@@ -164,6 +104,75 @@ function detectAddressedAssistant(text: string): string | undefined {
   if (!match) return undefined;
   const candidate = match[1].toLowerCase();
   return config.knownAssistantNames.includes(candidate) ? candidate : undefined;
+}
+
+export interface MirrorMessage {
+  channelId: string;
+  threadTs?: string;
+  ts: string;
+  userId: string;
+  /** The message text, with any forwarded text already appended. */
+  text: string;
+  files: SlackFile[];
+}
+
+export interface MirrorDeps {
+  /** Undefined when the food chat is off; then nothing is routed. */
+  foodChat: Pick<FoodChat, "chatForThread" | "submit"> | undefined;
+  /** The #ivy channel the mirror threads live in. */
+  channel: string;
+  timUserId: string;
+  /** The food chat's assistant; a message addressed to it is still Tim's turn. */
+  assistant: string;
+  /** Downloads the message's images; other files are skipped. */
+  downloadPhotos: (files: SlackFile[]) => Promise<Photo[]>;
+}
+
+/**
+ * Route Tim's reply in a food-chat mirror thread to that chat as a turn.
+ * Returns false, leaving the message to the normal Slack path, for any other
+ * thread, any other sender, and a message addressed to another assistant.
+ * The turn ID is the message ts, so a redelivered event is the same turn and
+ * the store runs it once. The food chat posts the reply; Tim's message is
+ * already in the thread and is not posted again.
+ */
+export async function routeFoodChatMessage(
+  m: MirrorMessage,
+  deps: MirrorDeps,
+): Promise<boolean> {
+  if (!deps.foodChat || !m.threadTs || m.channelId !== deps.channel) return false;
+  const chat = deps.foodChat.chatForThread(m.threadTs);
+  if (!chat) return false;
+  if (m.userId !== deps.timUserId) return false;
+  const addressed = detectAddressedAssistant(m.text);
+  if (addressed && addressed !== deps.assistant) return false;
+
+  const photos = m.files.length
+    ? await deps.downloadPhotos(m.files)
+    : [];
+  if (!m.text.trim() && !photos.length) return true;
+  const { turn, created } = await deps.foodChat.submit({
+    turnId: m.ts,
+    chat,
+    origin: "slack",
+    text: m.text,
+    photos,
+  });
+  log("food chat slack turn", { chat, turnId: turn.turnId, created, photos: photos.length });
+  return true;
+}
+
+async function downloadSlackPhotos(
+  files: SlackFile[],
+  channelId: string,
+  threadTs: string,
+): Promise<Photo[]> {
+  const images = files.filter((f) => f.mimetype?.startsWith("image/"));
+  if (!images.length) return [];
+  const saved = await downloadAttachments(images, config.foodChat.ivyDir, channelId, threadTs);
+  return Promise.all(
+    saved.map(async (a) => ({ name: a.name, mime: a.mimetype, data: await readFile(a.path) })),
+  );
 }
 
 interface ProcessParams {
@@ -372,7 +381,12 @@ async function processTurn({
   });
 }
 
-export function buildApp(): bolt.App {
+export function buildApp(
+  opts: {
+    /** The food chat, once started; undefined while it is off. */
+    foodChat?: () => FoodChat | undefined;
+  } = {},
+): bolt.App {
   // Watchdog logger: Bolt's socket-mode client emits a WARN log when a pong
   // isn't received from the server, but its auto-reconnect can silently fail
   // afterwards (process stays alive, websocket is dead). Intercept that WARN
@@ -494,6 +508,27 @@ export function buildApp(): bolt.App {
 
     if (!userId || !channelId || !ts) return;
 
+    // Include forwarded message text (quoted) beneath the user's own comment.
+    const prompt = forwarded.texts.length
+      ? [text.trim(), ...forwarded.texts].filter(Boolean).join("\n\n")
+      : text;
+
+    if (
+      await routeFoodChatMessage(
+        { channelId, threadTs, ts, userId, text: prompt, files },
+        {
+          foodChat: opts.foodChat?.(),
+          channel: config.foodChat.channel,
+          timUserId: config.foodChat.timUserId,
+          assistant: config.foodChat.assistant,
+          downloadPhotos: (photoFiles) =>
+            downloadSlackPhotos(photoFiles, channelId, threadTs ?? ts),
+        },
+      )
+    ) {
+      return;
+    }
+
     const threadRoot = threadTs ?? ts;
     const threadKey = buildThreadKey(channelId, threadRoot);
     const stored = await sessions.get(threadKey);
@@ -545,11 +580,6 @@ export function buildApp(): bolt.App {
     // text body) — the prompt will end up as just the attachment block.
     if (!text.trim() && files.length === 0 && forwarded.texts.length === 0)
       return;
-
-    // Include forwarded message text (quoted) beneath the user's own comment.
-    const prompt = forwarded.texts.length
-      ? [text.trim(), ...forwarded.texts].filter(Boolean).join("\n\n")
-      : text;
 
     log("received", {
       userId,

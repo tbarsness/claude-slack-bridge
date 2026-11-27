@@ -32,7 +32,7 @@ export interface DownloadedAttachment {
 /** Skip files larger than this; Slack itself caps uploads but be defensive. */
 const MAX_BYTES = 50 * 1024 * 1024;
 
-function sanitizeName(name: string): string {
+export function sanitizeName(name: string): string {
   const cleaned = name.replace(/[^A-Za-z0-9._-]+/g, "_").slice(0, 120);
   return cleaned || "file";
 }
@@ -62,7 +62,7 @@ const MIME_EXT: Record<string, string> = {
   "video/mp4": "mp4",
 };
 
-function ensureExtension(name: string, mimetype: string): string {
+export function ensureExtension(name: string, mimetype: string): string {
   if (/\.[A-Za-z0-9]{1,8}$/.test(name)) return name;
   const ext = MIME_EXT[mimetype];
   return ext ? `${name}.${ext}` : name;

@@ -5,3 +5,4 @@ dist/
 logs/
 sessions.json
 .DS_Store
+data/

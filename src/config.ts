@@ -1,5 +1,6 @@
-import { config as loadEnv } from "dotenv";
-import { resolve } from "node:path";
+import { config as loadEnv, parse as parseEnv } from "dotenv";
+import { readFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
 
 // Bridge-specific settings load first, so anything defined here wins.
 loadEnv();
@@ -106,6 +107,36 @@ if (defaultAssistant && !assistants[defaultAssistant]) {
   );
 }
 
+const sessionsFile = resolve(optional("SESSIONS_FILE", "./sessions.json"));
+const channelAssistants = parseChannelAssistants(
+  process.env.CHANNEL_ASSISTANTS,
+  assistants,
+);
+const allowedUserIds = required("ALLOWED_USER_IDS")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+
+/**
+ * The Food Log exec URL for the food chat's read-backs. FOODCHAT_FOODLOG_URL
+ * wins; otherwise it comes from FOODLOG_EXEC_URL in the assistant's own .env,
+ * so the URL lives in one place. Reads need no token.
+ */
+function foodlogUrl(assistantDir: string | undefined): string {
+  const direct = process.env.FOODCHAT_FOODLOG_URL?.trim();
+  if (direct) return direct;
+  if (!assistantDir) return "";
+  try {
+    const env = parseEnv(readFileSync(resolve(assistantDir, ".env"), "utf8"));
+    return env.FOODLOG_EXEC_URL?.trim() ?? "";
+  } catch {
+    return "";
+  }
+}
+
+const foodChatAssistant = optional("FOODCHAT_ASSISTANT", "ivy");
+const foodChatDir = assistants[foodChatAssistant];
+
 export const config = {
   slack: {
     botToken: required("SLACK_BOT_TOKEN"),
@@ -114,23 +145,17 @@ export const config = {
     /** Tim's read-only user token, for Slack links in board messages. */
     userToken: process.env.SLACK_USER_TOKEN?.trim() || undefined,
   },
-  allowedUserIds: required("ALLOWED_USER_IDS")
-    .split(",")
-    .map((s) => s.trim())
-    .filter(Boolean),
+  allowedUserIds,
   assistants,
   peerAssistants,
   knownAssistantNames: [...Object.keys(assistants), ...peerAssistants],
   defaultAssistant,
-  channelAssistants: parseChannelAssistants(
-    process.env.CHANNEL_ASSISTANTS,
-    assistants,
-  ),
+  channelAssistants,
   claude: {
     systemPrompt: process.env.CLAUDE_SYSTEM_PROMPT,
     model: process.env.CLAUDE_MODEL,
   },
-  sessionsFile: resolve(optional("SESSIONS_FILE", "./sessions.json")),
+  sessionsFile,
   logDir: resolve(optional("LOG_DIR", "./logs")),
   transcription: {
     // Slack voice clips are transcribed locally with whisper.cpp so the
@@ -177,5 +202,29 @@ export const config = {
     port: Number(optional("VOICE_PORT", "8737")),
     secret: optional("VOICE_SECRET", ""),
     assistant: optional("VOICE_ASSISTANT", "jude"),
+  },
+  foodChat: {
+    // Ivy Mobile's day and recipes chats. Bound to localhost and published to
+    // the tailnet with `tailscale serve` (see docs/food-chat.md). Not started
+    // without FOODCHAT_SECRET.
+    enabled: optional("FOODCHAT_ENABLED", "true") !== "false",
+    host: optional("FOODCHAT_BIND_HOST", "127.0.0.1"),
+    port: Number(optional("FOODCHAT_PORT", "8739")),
+    secret: optional("FOODCHAT_SECRET", ""),
+    dataDir: resolve(
+      optional("FOODCHAT_DATA_DIR", resolve(dirname(sessionsFile), "data/food-chat")),
+    ),
+    // The #ivy channel for mirror threads; defaults to the channel mapped to
+    // the assistant in CHANNEL_ASSISTANTS.
+    channel: optional(
+      "FOODCHAT_CHANNEL",
+      Object.entries(channelAssistants).find(([, name]) => name === foodChatAssistant)?.[0] ?? "",
+    ),
+    ivyDir: foodChatDir ?? "",
+    foodlogUrl: foodlogUrl(foodChatDir),
+    ceilingMs: Number(optional("FOODCHAT_TURN_CEILING_MS", String(15 * 60 * 1000))),
+    timUserId: optional("FOODCHAT_TIM_USER_ID", allowedUserIds[0] ?? ""),
+    /** The assistant that answers the food chat; addressing it is not a guest turn. */
+    assistant: foodChatAssistant,
   },
 };
