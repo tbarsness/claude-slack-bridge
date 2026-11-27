@@ -18,6 +18,7 @@ import {
 } from "./transcribe.js";
 import { parseVoiceTags, synthesizeAll } from "./speak.js";
 import type { FoodChat, Photo } from "./food-chat-endpoint.js";
+import { slackTablesAsMarkdown } from "./slack-tables.js";
 
 const { App } = bolt;
 
@@ -483,6 +484,8 @@ export function buildApp(
     const channelType =
       typeof m.channel_type === "string" ? m.channel_type : undefined;
     const text = typeof m.text === "string" ? m.text : "";
+    // Slack leaves tables out of `text`; they live only in the blocks.
+    const tables = slackTablesAsMarkdown(m.blocks);
     const directFiles: SlackFile[] = Array.isArray(m.files)
       ? (m.files as SlackFile[])
       : [];
@@ -509,9 +512,10 @@ export function buildApp(
     if (!userId || !channelId || !ts) return;
 
     // Include forwarded message text (quoted) beneath the user's own comment.
-    const prompt = forwarded.texts.length
-      ? [text.trim(), ...forwarded.texts].filter(Boolean).join("\n\n")
-      : text;
+    const prompt =
+      tables.length || forwarded.texts.length
+        ? [text.trim(), ...tables, ...forwarded.texts].filter(Boolean).join("\n\n")
+        : text;
 
     if (
       await routeFoodChatMessage(
@@ -578,7 +582,7 @@ export function buildApp(
 
     // Allow attachment-only messages (e.g. "here's a screenshot" with no
     // text body) — the prompt will end up as just the attachment block.
-    if (!text.trim() && files.length === 0 && forwarded.texts.length === 0)
+    if (!text.trim() && files.length === 0 && forwarded.texts.length === 0 && tables.length === 0)
       return;
 
     log("received", {
