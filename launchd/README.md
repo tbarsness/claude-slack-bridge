@@ -17,6 +17,7 @@ sed \
   -e "s|{{NODE_BIN}}|$NODE_BIN|g" \
   -e "s|{{REPO_DIR}}|$REPO_DIR|g" \
   -e "s|{{LOG_DIR}}|$LOG_DIR|g" \
+  -e "s|{{HOME}}|$HOME|g" \
   launchd/com.example.claude-slack-bridge.plist \
   > ~/Library/LaunchAgents/$LABEL.plist
 

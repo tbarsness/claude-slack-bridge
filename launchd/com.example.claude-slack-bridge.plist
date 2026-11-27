@@ -38,6 +38,10 @@
   <dict>
     <key>NODE_ENV</key>
     <string>production</string>
+    <!-- launchd's default PATH has no Homebrew, so sessions found only the
+         system Python 3.9 and no brew tools. -->
+    <key>PATH</key>
+    <string>{{HOME}}/.local/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
   </dict>
 
   <key>RunAtLoad</key>
